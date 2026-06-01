@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS clutter
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Local test runs / generated output that should not be committed
+.dryrun-out/
+*.log
+
+# Personal user config -- the committed vt_ir_config.ini ships with <you>
+# placeholders; this rule prevents accidentally committing a copy that has
+# been edited to point at lab-PC absolute paths.  Comment it out if you want
+# to share machine-specific config across multiple checkouts.
+# vt_ir_config.ini
