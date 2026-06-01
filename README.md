@@ -248,6 +248,19 @@ window visible, then re-run.
 software to v1.0.23.0+ or correct the `specac_exe` path in
 `vt_ir_config.ini`. Confirm with `where specac.cmd.exe` in a terminal.
 
+**`Specac CLI refused the command. … Not Running In Manual Mode`** — the
+Specac controller GUI is in Program Mode (the tab you use to run a
+`.prog` file), and the CLI only works in Manual Mode. Switch the GUI to
+Manual Mode (the home tab with the setpoint readout and arrow buttons)
+and re-run. The orchestrator aborts on this within one second — before
+OMNIC opens — so no spectra are collected at the wrong temperature.
+
+**`Specac CLI refused the command. … Received Invalid Value`** — Specac
+rejected a numeric argument. Most common cause: a leading decimal point
+like `tolerance_c = .5` in `vt_ir_config.ini`. Use `0.5` instead. (Recent
+versions of `vt_ir.py` normalize this automatically, but the underlying
+CLI is picky about it.)
+
 **`Missing BG files for sample …`** — the sample-mode preflight found no
 `BG_<sample>_<T>C.SPA` for one or more temperatures. The error message
 lists which other sample folders DO have BG files, in case you typed the

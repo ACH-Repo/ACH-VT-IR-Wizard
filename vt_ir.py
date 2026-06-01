@@ -276,9 +276,44 @@ class OmnicDDE:
 class Specac:
     """Wrapper around the specac.cmd CLI (controller software v1.0.23.0+)."""
 
+    # Substrings the Specac CLI prints when the controller refuses to do
+    # anything.  When any of these are observed in stdout/stderr, the CLI is
+    # NOT actually executing commands -- proceeding produces silently bad data
+    # (e.g. backgrounds collected at room temperature labelled as if they were
+    # at the requested setpoint).  Each maps to a human-actionable hint.
+    _FATAL_PATTERNS = [
+        ("not running in manual mode",
+         "Open the Specac Temperature Controller GUI and switch it to "
+         "Manual Mode (not Program Mode).  The CLI only works in Manual "
+         "Mode -- in Program Mode it returns this error for every command "
+         "without doing anything, which means goto_and_wait returns "
+         "instantly while the cell stays at room temperature."),
+        ("received invalid value",
+         "Specac rejected a numeric argument.  Common cause: a leading "
+         "decimal point like '.5' in vt_ir_config.ini ([heater] "
+         "tolerance_c).  Use '0.5' instead.  See the most recent Specac "
+         "command in the log."),
+    ]
+
     def __init__(self, exe: str, dry_run: bool = False):
         self.exe = exe
         self.dry_run = dry_run
+        # Latest stdout-or-stderr; preserved so error messages can include
+        # what Specac literally said, in addition to the orchestrator's hint.
+        self.last_output: str = ""
+
+    def _check_fatal(self, blob: str) -> None:
+        """Raise RuntimeError if the Specac response contains any pattern
+        from ``_FATAL_PATTERNS``.  See class docstring for why we abort
+        rather than warn."""
+        low = blob.lower()
+        for pattern, hint in self._FATAL_PATTERNS:
+            if pattern in low:
+                raise RuntimeError(
+                    f"Specac CLI refused the command.\n"
+                    f"Specac said: {blob}\n\n"
+                    f"What to do:\n    {hint}"
+                )
 
     def _run(self, *args: str, timeout: Optional[float] = None) -> str:
         cmd = [self.exe, *args]
@@ -294,10 +329,10 @@ class Specac:
                 f"Could not find specac.cmd at:\n    {self.exe}\n"
                 "Check the [specac] exe path in vt_ir_config.ini."
             )
-        # Promote stdout/stderr logging to INFO whenever they have content -- we
-        # need to see what query commands like 'temp?' actually print, since
-        # the manual doesn't document the format.  Empty calls (e.g. 'on') stay
-        # quiet because the conditional skips them.
+        # Promote stdout/stderr logging to INFO whenever they have content --
+        # we need to see what query commands like 'temp?' actually print,
+        # since the manual doesn't document the format.  Empty calls (e.g.
+        # 'on') stay quiet because the conditional skips them.
         out = (r.stdout or "").strip()
         err = (r.stderr or "").strip()
         if out:
@@ -306,21 +341,39 @@ class Specac:
             logging.info("Specac stderr: %r", err)
         if r.returncode != 0:
             logging.warning("Specac returned %d.", r.returncode)
+        self.last_output = out or err
+        # ABORT loudly on the known fatal patterns -- previous behaviour was
+        # to log a WARNING and proceed, which produced 12 mislabelled
+        # room-temperature backgrounds before anyone noticed.
+        self._check_fatal(self.last_output)
         # Many Specac.Cmd queries print to stderr rather than stdout; return
         # whichever is non-empty so the caller can parse it.
-        return out or err
+        return self.last_output
+
+    @staticmethod
+    def _fmt(value) -> str:
+        """Normalise a numeric argument for Specac.Cmd.  The CLI rejects
+        leading-dot floats like ``.5`` (it expects ``0.5``), so we route
+        every numeric input through ``float()`` and then ``:g`` formatting.
+        Integers stay compact (``50`` not ``50.0``)."""
+        try:
+            return f"{float(value):g}"
+        except (TypeError, ValueError):
+            # If the caller passed a non-numeric string, pass it through and
+            # let Specac complain so the user sees what they wrote.
+            return str(value)
 
     # -- commands ----------------------------------------------------------
     def on(self):  self._run("on")
     def off(self): self._run("off")
 
     def set_units_c(self):           self._run("c")
-    def set_tolerance(self, deg):    self._run("tol", str(deg))
-    def set_ramp(self, rate):        self._run("ramp", str(rate))
+    def set_tolerance(self, deg):    self._run("tol", self._fmt(deg))
+    def set_ramp(self, rate):        self._run("ramp", self._fmt(rate))
 
     def goto_and_wait(self, T: float, timeout: float = 3600.0) -> None:
         """Set setpoint and block until reached (within tolerance)."""
-        self._run("sp", str(T), "w", timeout=timeout)
+        self._run("sp", self._fmt(T), "w", timeout=timeout)
 
     # Pattern matches the first signed decimal number in a string, with
     # either '.' or ',' as the decimal separator -- the Specac CLI on the
@@ -845,11 +898,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         specac.set_ramp(heater.get("ramp_c_per_min", "50"))
         specac.on()
 
-        # Log the cell temperature before we start ramping -- gives the user
-        # ground-truth context in the .log file.
+        # Pre-flight: confirm the controller actually responds to a 'temp?'
+        # query.  Catches Manual-Mode-not-set and other GUI-state issues
+        # before we waste a session collecting backgrounds at the wrong
+        # temperature.  _run() already raises on the known fatal error
+        # strings, so reaching here with start_T None means the controller
+        # returned something we couldn't parse -- still cause for abort.
         start_T = specac.get_temp()
-        if start_T is not None:
-            logging.info("Cell temperature before ramping: %.1f C.", start_T)
+        if start_T is None:
+            raise RuntimeError(
+                "Specac CLI is reachable but 'temp?' did not return a "
+                "parseable number.\n"
+                f"Last Specac output: {specac.last_output!r}\n"
+                "Open the controller GUI, verify Manual Mode is active, "
+                "and try again."
+            )
+        logging.info("Cell temperature before ramping: %.1f C.", start_T)
 
         # OMNIC preamble  ----------------------------------------------
         with OmnicDDE(
@@ -878,28 +942,34 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 # Sanity check: Specac.Cmd has been observed returning from
                 # "sp T w" while the cell was still far from T (stuck "Wait"
-                # state from a previous program).  Query temp? and abort
-                # before we waste a scan on the wrong temperature.
+                # state, or controller GUI not in Manual Mode).  Query temp?
+                # and abort before OMNIC collects at the wrong temperature.
+                # If temp? can't be read at all, abort too -- "proceeding
+                # without sanity check" once produced a full session of 12
+                # backgrounds collected at room temperature.
                 actual_T = specac.get_temp()
                 if actual_T is None:
-                    logging.warning(
-                        "Could not read cell temperature via 'temp?' after "
-                        "setpoint wait -- proceeding without sanity check."
+                    raise RuntimeError(
+                        f"Could not read cell temperature via 'temp?' after "
+                        f"the setpoint wait for {T} C.\n"
+                        f"Last Specac output: {specac.last_output!r}\n"
+                        f"The controller may have lost Manual Mode mid-run "
+                        f"or changed its output format.  Aborting before "
+                        f"OMNIC collects at an unknown temperature."
                     )
-                else:
-                    delta = abs(actual_T - T)
-                    logging.info("Cell temperature: %.1f C (target %d C, delta %.1f C).",
-                                 actual_T, T, delta)
-                    if delta > sp_check_margin:
-                        raise RuntimeError(
-                            f"Specac reported 'setpoint reached' but cell is at "
-                            f"{actual_T:.1f} C (target {T} C, allowed delta "
-                            f"{sp_check_margin:.1f} C).  This is the false-wait "
-                            f"bug seen before -- usually fixed by closing and "
-                            f"reopening the Specac controller GUI to clear any "
-                            f"stuck program state.  Aborting before OMNIC starts "
-                            f"a collection at the wrong temperature."
-                        )
+                delta = abs(actual_T - T)
+                logging.info("Cell temperature: %.1f C (target %d C, delta %.1f C).",
+                             actual_T, T, delta)
+                if delta > sp_check_margin:
+                    raise RuntimeError(
+                        f"Specac reported 'setpoint reached' but cell is at "
+                        f"{actual_T:.1f} C (target {T} C, allowed delta "
+                        f"{sp_check_margin:.1f} C).  This is the false-wait "
+                        f"bug -- usually fixed by closing and reopening the "
+                        f"Specac controller GUI to clear any stuck program "
+                        f"state.  Aborting before OMNIC starts a collection "
+                        f"at the wrong temperature."
+                    )
 
                 logging.info("Setpoint reached.  Equilibrating for %d s.", equilibration)
                 if not args.dry_run:
