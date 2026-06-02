@@ -2,14 +2,25 @@
 """
 analyse_live.py  --  Live-updating overlay plot for a VT-IR session.
 
-While vt_ir.py is running on the lab PC, launch this script in a separate
-console.  It opens a matplotlib window that re-reads the Specac controller's
-.log file and the .SPA files in the current session folder every few seconds
-and re-draws the temperature/setpoint trace with scan-event overlays.
+While vt_ir.py is running, this opens a matplotlib window that re-reads the
+Specac controller's .log file and the .SPA files in the current session folder
+every few seconds and re-draws the temperature/setpoint trace with scan-event
+overlays.
 
-The data-loading logic is the same as the stand-alone analyse.py reference --
-only difference is that here it's wrapped in a polling loop and the paths can
-be auto-detected (or overridden via CLI).
+vt_ir.py launches this automatically (one window per run).  You can also run it
+standalone to re-examine a finished run.
+
+Key behaviours:
+
+  * --since <ISO>   Clip the view to a single run's time window.  vt_ir.py
+                    passes its run-start time here so the background pass and
+                    the sample pass don't pile into one cramped plot.
+  * Zoom is preserved across refreshes.  Once you zoom or pan, live updates
+    stop rescaling the axes; press 'f' in the window to resume auto-follow.
+  * SVG auto-save.  When vt_ir.py signals the run is finished (via --done-file),
+    the plot saves itself <save-delay> seconds later (capturing the cool-down
+    tail).  It also saves on manual window close.  Files land in
+    <plot-dir>/<sample>/<sample>_<LABEL>_<timestamp>.svg.
 
 Usage:
     python analyse_live.py                       # auto-detect newest session + log
@@ -28,7 +39,6 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
-from glob import glob
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -52,13 +62,12 @@ DEFAULT_SPECAC_LOGS = r"C:\Users\<you>\Documents\Specac Temperature Controller\L
 
 
 # ---------------------------------------------------------------------------
-# Parsing -- same shape as analyse.py, but tolerant of an in-progress file.
+# Parsing -- tolerant of an in-progress (actively-written) log file.
 # ---------------------------------------------------------------------------
 
 def get_data(path: str) -> Dict[str, list]:
     """Read a Specac controller .log file.  Returns parallel columns keyed by
-    header name.  Robust against an incomplete trailing row (the file may be
-    actively being written)."""
+    header name.  Robust against an incomplete trailing row."""
     with open(path, "r", encoding="utf-8", errors="replace") as inf:
         lines = inf.read().strip().split("\n")
     if len(lines) < 3:
@@ -125,15 +134,13 @@ def newest(paths: List[Path]) -> Optional[Path]:
 
 
 def find_specac_log(folder: Path) -> Optional[Path]:
-    candidates = list(folder.glob("*.log"))
-    return newest(candidates)
+    return newest(list(folder.glob("*.log")))
 
 
 def find_session_dir(output_root: Path, sample: Optional[str]) -> Optional[Path]:
     if sample:
         d = output_root / sample
         return d if d.exists() else None
-    # Newest sub-folder under output_root.
     subdirs = [p for p in output_root.iterdir() if p.is_dir()] if output_root.exists() else []
     return newest(subdirs)
 
@@ -150,8 +157,12 @@ def load_config(path: Path) -> configparser.ConfigParser:
 # ---------------------------------------------------------------------------
 
 def render(ax, specac_log: Optional[Path], session_dir: Optional[Path],
-           scan_duration_s: float) -> Tuple[str, int, int]:
-    """(Re-)draw the overlay plot.  Returns a status string + counts for logging."""
+           scan_duration_s: float,
+           since: Optional[datetime] = None) -> Tuple[str, int, int]:
+    """(Re-)draw the overlay plot on ``ax`` at full extent (autoscaling).
+
+    ``since`` clips the Specac trace and .SPA markers to a single run's
+    time window.  Returns a status string + (#trace points, #scan markers)."""
     ax.clear()
 
     # --- temperature trace ---
@@ -166,35 +177,47 @@ def render(ax, specac_log: Optional[Path], session_dir: Optional[Path],
                     ha="center", va="top", transform=ax.transAxes, color="red")
         if data.get("Time (s)"):
             log_start = get_file_creation_date(str(specac_log))
-            xs = [log_start + timedelta(seconds=s) for s in data["Time (s)"]]
-            y_T = data.get("Temperature (C)", [])
-            y_sp = data.get("Setpoint (C)", [])
+            xs_all = [log_start + timedelta(seconds=s) for s in data["Time (s)"]]
+            y_T_all = data.get("Temperature (C)", [])
+            y_sp_all = data.get("Setpoint (C)", [])
+
+            # Clip to the current run's window.  keep[i] gates the trace AND
+            # the event markers below so an old run's data can't drag the view.
+            keep = [since is None or x >= since for x in xs_all]
+            xs = [x for x, k in zip(xs_all, keep) if k]
+            y_T = [v for v, k in zip(y_T_all, keep) if k]
+            y_sp = [v for v, k in zip(y_sp_all, keep) if k]
+
             ax.plot(xs, y_T, "r-", lw=0.8, label="Temperature")
             ax.plot(xs, y_sp, "g-", lw=0.8, label="Setpoint")
             n_pts = len(xs)
 
-            # Wait Started / Wait Completed event lines
+            # Wait Started / Wait Completed event lines (also clipped).
             for prefix, color, label in [
                 ("Wait Started",   "orange", "Wait Started"),
                 ("Wait Completed", "purple", "Wait Completed"),
             ]:
-                inds = find_events(data, prefix)
-                for i, idx in enumerate(inds):
-                    if 0 <= idx < len(xs):
-                        ax.axvline(xs[idx], lw=0.6, color=color, ls="dashed",
-                                   label=label if i == 0 else None)
+                drawn = False
+                for idx in find_events(data, prefix):
+                    if 0 <= idx < len(xs_all) and keep[idx]:
+                        ax.axvline(xs_all[idx], lw=0.6, color=color, ls="dashed",
+                                   label=label if not drawn else None)
+                        drawn = True
 
     # --- scan markers from .SPA files ---
     n_spa = 0
     if session_dir and session_dir.exists():
         # On Windows (the documented target) pathlib globs are case-insensitive,
-        # so a single "*.SPA" pattern already matches .SPA, .spa, .Spa, etc.
+        # so a single "*.SPA" pattern already matches .SPA, .spa, etc.
         spa_paths = sorted(session_dir.glob("*.SPA"),
                            key=lambda p: p.stat().st_mtime)
         labelled = set()
         for path in spa_paths:
-            kind = classify_spa(path.name)
             end_time = get_file_creation_date(str(path))
+            # Skip files from earlier runs (e.g. BG files during a sample run).
+            if since is not None and end_time < since:
+                continue
+            kind = classify_spa(path.name)
             start_time = end_time - timedelta(seconds=scan_duration_s)
             lab = SCHEDULE_KINDS[kind]["label"] if kind not in labelled else None
             labelled.add(kind)
@@ -230,6 +253,40 @@ def render(ax, specac_log: Optional[Path], session_dir: Optional[Path],
     return ("ok", n_pts, n_spa)
 
 
+def save_snapshot(plot_dir: Path, sample: str, label: str,
+                  specac_log: Optional[Path], session_dir: Optional[Path],
+                  scan_duration_s: float,
+                  since: Optional[datetime]) -> Optional[Path]:
+    """Render the overlay onto a FRESH figure (so it is always full extent,
+    independent of any zoom in the interactive window) and save it as SVG to
+    ``<plot_dir>/<sample>/<sample>_<label>_<timestamp>.svg``.  Returns the
+    path written, or None if there was nothing to plot."""
+    out_dir = Path(plot_dir) / sample
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = out_dir / f"{sample}_{label}_{stamp}.svg"
+
+    fig2, ax2 = plt.subplots(figsize=(12, 5), layout="constrained")
+    try:
+        _, n_pts, n_spa = render(ax2, specac_log, session_dir,
+                                 scan_duration_s, since)
+        if not (n_pts or n_spa):
+            return None
+        fig2.savefig(out)  # SVG inferred from the .svg extension
+    finally:
+        plt.close(fig2)
+    return out
+
+
+def _read_finish_time(done_file: Path) -> float:
+    """Epoch seconds the run finished.  Prefers the ISO timestamp written
+    inside the sentinel; falls back to the file's mtime."""
+    try:
+        return datetime.fromisoformat(done_file.read_text(encoding="utf-8").strip()).timestamp()
+    except Exception:
+        return done_file.stat().st_mtime
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -243,46 +300,110 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--specac-logs", default=None,
                    help="Override Specac controller log folder.")
     p.add_argument("--scan-duration", type=float, default=210.0,
-                   help="Estimated scan duration in seconds (used to draw the "
-                        "shaded scan band; default 210 s = 128 scans @ 2 cm-1).")
+                   help="Estimated scan duration in seconds (shaded band width).")
     p.add_argument("--interval", type=float, default=5.0,
                    help="Refresh interval in seconds (default 5).")
     p.add_argument("--once", action="store_true",
-                   help="Render the plot once and exit.")
+                   help="Render the plot once and exit (no auto-save).")
+    # Args below are normally supplied by vt_ir.py when it spawns the plotter.
+    p.add_argument("--since", default=None,
+                   help="ISO timestamp; clip the view to data at/after this time "
+                        "(scopes the plot to one run).")
+    p.add_argument("--label", default="SNAPSHOT",
+                   help="BG or SAMPLE -- used in the saved SVG filename.")
+    p.add_argument("--done-file", default=None,
+                   help="Sentinel file vt_ir.py writes when the run finishes; "
+                        "triggers the delayed auto-save.")
+    p.add_argument("--plot-dir", default=None,
+                   help="Where to save SVG snapshots (default: [paths] plot_dir, "
+                        "else a 'plots' folder next to output_root).")
+    p.add_argument("--save-delay", type=float, default=None,
+                   help="Seconds after run finish before auto-saving "
+                        "(default: [live_plot] save_delay_s, else 600).")
     args = p.parse_args(argv)
 
     cfg = load_config(Path(args.config))
     paths = cfg["paths"] if cfg.has_section("paths") else {}
+    live = cfg["live_plot"] if cfg.has_section("live_plot") else {}
 
     output_root = Path(paths.get("output_root", "."))
     specac_logs = Path(
-        args.specac_logs
-        or paths.get("specac_log_dir")
-        or DEFAULT_SPECAC_LOGS
+        args.specac_logs or paths.get("specac_log_dir") or DEFAULT_SPECAC_LOGS
     )
+    plot_dir_str = (args.plot_dir or paths.get("plot_dir") or "").strip()
+    plot_dir = Path(plot_dir_str) if plot_dir_str else output_root.parent / "plots"
+    save_delay = (args.save_delay if args.save_delay is not None
+                  else float(live.get("save_delay_s", "600")))
+
+    since: Optional[datetime] = None
+    if args.since:
+        try:
+            since = datetime.fromisoformat(args.since)
+        except ValueError:
+            print(f"[warn] could not parse --since {args.since!r}; showing all data.")
+
+    done_file = Path(args.done_file) if args.done_file else None
 
     fig, ax = plt.subplots(figsize=(12, 5), layout="constrained")
+
+    # 'f' key resumes auto-follow after the user has zoomed/panned.
+    follow = {"force": False}
+
+    def on_key(event):
+        if event.key == "f":
+            follow["force"] = True
+            print("[f] resuming auto-follow (full extent).")
+
     if not args.once:
-        fig.canvas.manager.set_window_title("VT-IR live")
-        # Make sure plt.pause() actually yields the GUI loop.
+        try:
+            fig.canvas.manager.set_window_title("VT-IR live")
+        except Exception:
+            pass
+        fig.canvas.mpl_connect("key_press_event", on_key)
         try:
             matplotlib.use(matplotlib.get_backend())
         except Exception:
             pass
 
+    # State carried across loop iterations.
+    saved = False
+    done_at: Optional[float] = None
     last_summary = ""
+    specac_log: Optional[Path] = None
+    session_dir: Optional[Path] = None
+
+    def snapshot_name() -> str:
+        return args.sample or (session_dir.name if session_dir else "session")
+
     try:
         while True:
             specac_log = find_specac_log(specac_logs)
             session_dir = find_session_dir(output_root, args.sample)
 
+            # --- zoom preservation -------------------------------------
+            # matplotlib turns autoscale OFF on an axis the moment the user
+            # zooms or pans.  render() does ax.clear() (autoscale back ON) and
+            # autoscales to full.  So: if autoscale is off going in, the user
+            # has zoomed -> remember and restore their view after the redraw.
+            frozen = not (ax.get_autoscalex_on() and ax.get_autoscaley_on())
+            if follow["force"]:
+                frozen = False
+                follow["force"] = False
+            prev_xlim, prev_ylim = ax.get_xlim(), ax.get_ylim()
+
             status, n_pts, n_spa = render(
-                ax, specac_log, session_dir, args.scan_duration,
+                ax, specac_log, session_dir, args.scan_duration, since,
             )
+
+            if frozen:
+                ax.set_xlim(prev_xlim)
+                ax.set_ylim(prev_ylim)
+
             summary = (
                 f"specac_log={specac_log.name if specac_log else '<none>'}  "
                 f"session={session_dir.name if session_dir else '<none>'}  "
                 f"pts={n_pts}  scans={n_spa}"
+                + ("  [zoom held; press f to follow]" if frozen else "")
             )
             if summary != last_summary:
                 print(f"[{datetime.now():%H:%M:%S}] {summary}")
@@ -292,18 +413,40 @@ def main(argv: Optional[List[str]] = None) -> int:
                 plt.show()
                 return 0
 
-            # plt.pause yields to the GUI event loop AND sleeps -- exactly what
-            # we want for a low-effort live update.  If the user has closed
-            # the window, plt.pause raises -> we exit cleanly.
+            # --- delayed auto-save once the run is flagged finished ----
+            if done_file is not None and done_at is None and done_file.exists():
+                finish = _read_finish_time(done_file)
+                done_at = finish + save_delay
+                print(f"[done] run finished {datetime.fromtimestamp(finish):%H:%M:%S}; "
+                      f"snapshot scheduled for {datetime.fromtimestamp(done_at):%H:%M:%S}")
+            if done_at is not None and not saved and time.time() >= done_at:
+                out = save_snapshot(plot_dir, snapshot_name(), args.label,
+                                    specac_log, session_dir, args.scan_duration, since)
+                saved = True
+                print(f"[saved] {out}" if out else "[saved] nothing to plot yet.")
+
+            # plt.pause yields to the GUI event loop AND sleeps.  If the window
+            # was closed it raises -> we drop out and the finally saves.
             try:
                 plt.pause(max(0.1, args.interval))
             except Exception:
-                return 0
+                break
             if not plt.fignum_exists(fig.number):
-                return 0
+                break
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        return 0
+    finally:
+        # Save-on-exit (manual close / Ctrl-C), unless the timer already did,
+        # or this was a one-shot render.
+        if not saved and not args.once:
+            try:
+                out = save_snapshot(plot_dir, snapshot_name(), args.label,
+                                    specac_log, session_dir, args.scan_duration, since)
+                if out:
+                    print(f"[saved on exit] {out}")
+            except Exception as e:
+                print(f"[warn] could not save on exit: {e}")
+    return 0
 
 
 if __name__ == "__main__":

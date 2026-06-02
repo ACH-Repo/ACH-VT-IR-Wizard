@@ -644,11 +644,21 @@ def survey_bg_folders(bg_root: Path) -> Dict[str, List[int]]:
 def spawn_live_plot(sample: str,
                     config_path: Path,
                     live_cfg,
-                    dry_run: bool) -> Optional[subprocess.Popen]:
+                    dry_run: bool,
+                    since_iso: str,
+                    mode_label: str,
+                    done_file: Path,
+                    plot_dir: Path,
+                    save_delay_s: str) -> Optional[subprocess.Popen]:
     """Spawn analyse_live.py in a fresh console window, locked onto this
     run's sample folder.  Returns the Popen handle, or None if spawning was
     skipped or failed.  The orchestrator does NOT terminate the plotter on
-    exit -- the user closes the plot window when they're done with it."""
+    exit -- the user closes the plot window when they're done with it.
+
+    The extra arguments let the plotter (a) clip its view to just this run
+    (``--since``), (b) auto-save an SVG once the run finishes -- detected via
+    the ``--done-file`` the orchestrator writes in its finally block -- and
+    name it by mode (``--label``)."""
     if dry_run:
         logging.info("[dry-run] would spawn analyse_live.py for sample %r.", sample)
         return None
@@ -663,6 +673,11 @@ def spawn_live_plot(sample: str,
         "--sample", sample,
         "--interval", str(live_cfg.get("interval_s", "5")),
         "--scan-duration", str(live_cfg.get("scan_duration_s", "210")),
+        "--since", since_iso,
+        "--label", mode_label,
+        "--done-file", str(done_file),
+        "--plot-dir", str(plot_dir),
+        "--save-delay", str(save_delay_s),
     ]
     kwargs = {}
     if sys.platform == "win32":
@@ -687,9 +702,9 @@ def build_session_dir(out_root: Path, sample: str) -> Path:
     return d
 
 
-def configure_logging(log_dir: Path, sample: str, mode_label: str) -> Path:
+def configure_logging(log_dir: Path, sample: str, mode_label: str,
+                      stamp: str) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"{stamp}_{sample}_{mode_label}.log"
     handlers = [logging.FileHandler(log_file, encoding="utf-8"),
                 logging.StreamHandler(sys.stdout)]
@@ -807,7 +822,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     session_dir = build_session_dir(out_root, sample)
     bg_dir = build_session_dir(bg_root, sample)
     log_dir = Path(paths["log_dir"])
-    log_file = configure_logging(log_dir, sample, mode_label)
+    # Plot snapshots go to a parallel "plots" folder; default beside output_root.
+    plot_dir_cfg = paths.get("plot_dir", "").strip()
+    plot_dir = Path(plot_dir_cfg) if plot_dir_cfg else out_root.parent / "plots"
+    # One run stamp drives both the log filename and the per-run done-file the
+    # live plotter watches for.
+    run_stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = configure_logging(log_dir, sample, mode_label, run_stamp)
 
     # -- pre-flight summary ----------------------------------------------
     logging.info("Sample:                %s", sample)
@@ -865,6 +886,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # -- spawn live overlay plot (in its own window) ----------------------
     # Done AFTER the Ready prompt so a plot window doesn't pop up while the
     # user is still typing answers, and locked onto the just-confirmed sample.
+    # done_file stays None unless we actually spawn a plotter; it's the
+    # per-run sentinel the plotter watches to know when to auto-save its SVG.
+    done_file: Optional[Path] = None
     live_enabled = str(live_cfg.get("enabled", "true")).strip().lower() in (
         "1", "true", "yes", "y", "on"
     )
@@ -873,7 +897,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif not live_enabled:
         logging.info("Live overlay plot disabled in config ([live_plot] enabled).")
     else:
-        spawn_live_plot(sample, Path(args.config), live_cfg, args.dry_run)
+        done_file = session_dir / f"{run_stamp}.done"
+        # Remove any stale sentinel (shouldn't exist for a fresh stamp, but be safe).
+        try:
+            done_file.unlink()
+        except FileNotFoundError:
+            pass
+        spawn_live_plot(
+            sample, Path(args.config), live_cfg, args.dry_run,
+            since_iso=dt.datetime.now().isoformat(timespec="seconds"),
+            mode_label=mode_label,
+            done_file=done_file,
+            plot_dir=plot_dir,
+            save_delay_s=live_cfg.get("save_delay_s", "600"),
+        )
 
     # -- run --------------------------------------------------------------
     specac = Specac(paths["specac_exe"], dry_run=args.dry_run)
@@ -995,6 +1032,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             specac.off()
         except Exception as e:
             logging.warning("Could not switch heater off: %s", e)
+        # Signal the live plotter that this run is over, so it can capture the
+        # cool-down tail and auto-save its SVG.  Written on every exit path
+        # (normal finish OR abort) so a snapshot is always taken.
+        if done_file is not None and not args.dry_run:
+            try:
+                done_file.write_text(
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logging.warning("Could not write run-complete sentinel: %s", e)
 
     # -- summary ----------------------------------------------------------
     logging.info("=" * 60)

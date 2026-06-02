@@ -99,7 +99,13 @@ All temperatures are in °C and must fall within `[tmin, tmax]` from the config.
   explicit `off` → `on` at start, queries `temp?` after every `sp T w`, and
   aborts before OMNIC collects at the wrong temperature.
 - **Live overlay plot** — auto-launches alongside the orchestrator and
-  re-reads the Specac log + the session folder every few seconds.
+  re-reads the Specac log + the session folder every few seconds. It is
+  scoped to the current run (the background pass and the sample pass don't
+  pile into one cramped image), preserves your zoom across refreshes (press
+  `f` to resume auto-follow), and auto-saves an SVG snapshot — once the run
+  finishes plus `save_delay_s` (default 10 min, to capture the cool-down
+  tail), and again on manual window close. Snapshots land in
+  `<plot_dir>/<sample>/<sample>_<BG|SAMPLE>_<timestamp>.svg`.
 - **Tracebacks land in the run log** — if something blows up at 3 AM, the
   full traceback is in the same `.log` file as the call history that
   preceded it.
