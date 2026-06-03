@@ -278,11 +278,24 @@ controller's CLI returned from `sp T w` while the cell was still far from
 if it triggers anyway, close and reopen the Specac controller GUI to fully
 clear it, then re-run.
 
-**`dde.error: Exec failed` mid-collection** — pywin32's DDE Exec has a
-hard 60 s transaction timeout. The orchestrator always issues collect
-commands with `Polling` and waits via `MenuStatus`, so this should be
-impossible from `vt_ir.py` — but if you wire your own DDE calls from
-elsewhere, that's the explanation.
+**`OMNIC did not accept 'sample …' after N attempt(s)` / repeated
+collections fail to start** — OMNIC accepted the file/display commands
+(Import, SetAsBackground) but could not *start* the actual collection. The
+DDE channel is fine; the **iS5 bench is wedged** — a dialog is open in
+OMNIC, a scan is already running, or (most common) the spectrometer has
+dropped offline. The orchestrator reconnects and retries `collect_retries`
+times first; if that fails it aborts with this message. **Fix: restart
+OMNIC.** The bench can stay wedged across runs until OMNIC is restarted —
+which is why re-running without restarting keeps failing on the very first
+collection. If it recurs specifically during a long passive cool-down,
+the lengthening gap between scans may be letting the bench idle out;
+restarting OMNIC before the sample pass and keeping an eye on the first
+down-scan collection is the practical workaround.
+
+**`dde.error: Exec failed` mid-collection** — the underlying pywin32 error
+behind the message above (pywin32's DDE Exec has a hard 60 s transaction
+timeout, which trips when OMNIC can't start the command). Handled by the
+retry/reconnect logic; see the entry above.
 
 **Heater not switching off after a crash** — the `finally` block calls
 `specac.cmd off` on every exit path, including Ctrl-C. If you killed the

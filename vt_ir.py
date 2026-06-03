@@ -74,16 +74,56 @@ class OmnicDDE:
     def __init__(self,
                  dry_run: bool = False,
                  poll_interval_s: float = 2.0,
-                 collect_timeout_s: float = 1800.0):
+                 collect_timeout_s: float = 1800.0,
+                 collect_retries: int = 2,
+                 retry_delay_s: float = 5.0):
         """`poll_interval_s` and `collect_timeout_s` govern how long we wait
         for OMNIC to finish a CollectBackground / CollectSample.  Increase
         `collect_timeout_s` if you run experiments that take longer than
-        30 minutes per spectrum."""
+        30 minutes per spectrum.
+
+        `collect_retries` / `retry_delay_s` control recovery when OMNIC
+        refuses to *start* a collection (a Polling Exec that blocks ~60 s and
+        raises dde.error -- see _collect)."""
         self.dry_run = dry_run
         self.poll_interval_s = poll_interval_s
         self.collect_timeout_s = collect_timeout_s
+        self.collect_retries = collect_retries
+        self.retry_delay_s = retry_delay_s
         self._server = None
         self._conv = None
+        self._conn_seq = 0  # unique DDE server name per (re)connect
+
+    def _connect(self) -> None:
+        """Create a DDE server + conversation and connect to OMNIC.  Each call
+        uses a fresh server name so a reconnect doesn't collide with the
+        previous (shut-down) server."""
+        import win32ui  # noqa: F401  (required for the dde module to load)
+        import dde
+        self._conn_seq += 1
+        self._server = dde.CreateServer()
+        self._server.Create(f"VT_IR_Client_{self._conn_seq}")
+        self._conv = dde.CreateConversation(self._server)
+        self._conv.ConnectTo(self.APP, self.TOPIC)
+
+    def _teardown(self) -> None:
+        try:
+            self._conv = None
+            if self._server is not None:
+                self._server.Shutdown()
+        except Exception:
+            pass
+        self._server = None
+
+    def reconnect(self) -> None:
+        """Drop the current DDE channel and open a fresh one.  Used to clear a
+        stuck conversation after a failed collect Exec."""
+        if self.dry_run:
+            return
+        self._teardown()
+        time.sleep(0.5)
+        self._connect()
+        logging.info("Reconnected to OMNIC via DDE.")
 
     def __enter__(self):
         if self.dry_run:
@@ -91,18 +131,15 @@ class OmnicDDE:
             return self
         try:
             import win32ui  # noqa: F401  (required for the dde module to load)
-            import dde
+            import dde  # noqa: F401
         except ImportError as e:
             raise SystemExit(
                 "pywin32 is required for OMNIC DDE access.\n"
                 "Install it with:  pip install pywin32\n"
                 f"(import error: {e})"
             )
-        self._server = dde.CreateServer()
-        self._server.Create("VT_IR_Client")
-        self._conv = dde.CreateConversation(self._server)
         try:
-            self._conv.ConnectTo(self.APP, self.TOPIC)
+            self._connect()
         except Exception as e:
             raise SystemExit(
                 f"Could not open DDE conversation with OMNIC ({e}).\n"
@@ -114,12 +151,7 @@ class OmnicDDE:
     def __exit__(self, exc_type, exc, tb):
         if self.dry_run:
             return
-        try:
-            self._conv = None
-            if self._server is not None:
-                self._server.Shutdown()
-        except Exception:
-            pass
+        self._teardown()
 
     # -- low-level ---------------------------------------------------------
     def exec(self, cmd: str) -> None:
@@ -234,13 +266,74 @@ class OmnicDDE:
     # Exec call returns immediately and Python (not Windows DDE) controls the
     # wait via _wait_until_idle.  This is the only reliable way to handle
     # collections that take longer than the 60-second DDE transaction window.
+    def _collect(self, command: str, menu_item: str, what: str) -> None:
+        """Issue a Polling collect Exec and wait for it to finish, recovering
+        from a stuck DDE channel.
+
+        With the Polling keyword the Exec normally returns in <2 s.  If OMNIC
+        cannot start the collection -- because it is showing a dialog, is
+        already mid-scan, or (most often seen on the lab iS5) the spectrometer
+        bench has gone offline -- the Exec instead blocks ~60 s and raises
+        dde.error.  Rather than killing a multi-hour run on a single hiccup we
+        reconnect the DDE channel and retry a few times.  Before re-issuing we
+        check MenuStatus on the fresh channel so we never start a second
+        collection on top of one that did manage to begin.
+        """
+        attempts = self.collect_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self.exec(command)
+                self._wait_until_idle(menu_item)
+                return
+            except TimeoutError:
+                # Collection started but never finished within collect_timeout_s.
+                # That is a different failure; don't retry-spam it.
+                raise
+            except Exception as e:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"OMNIC did not accept '{what}' after {attempts} "
+                        f"attempt(s) ({e}).\n"
+                        f"OMNIC could not START the collection.  The DDE channel "
+                        f"itself works (file/display commands succeed) -- this is "
+                        f"almost always the iS5 bench being wedged: a dialog is "
+                        f"open in OMNIC, a scan is already running, or the bench "
+                        f"has dropped offline.\n"
+                        f"What to do: bring the OMNIC window to the front, dismiss "
+                        f"any dialog, confirm no collection is in progress -- and "
+                        f"if that doesn't help, RESTART OMNIC.  The bench can stay "
+                        f"wedged across runs until OMNIC is restarted, which is why "
+                        f"repeated re-runs keep failing on the first collection."
+                    ) from e
+                logging.warning(
+                    "'%s' did not start (%s).  Reconnecting and retrying "
+                    "(attempt %d of %d) ...", what, e, attempt, attempts,
+                )
+                time.sleep(self.retry_delay_s)
+                try:
+                    self.reconnect()
+                except Exception as re_err:
+                    logging.warning("DDE reconnect failed: %s", re_err)
+                    continue
+                # If a collection actually did start (despite the failed ack),
+                # MenuStatus will be Disabled -- wait for it, don't re-issue.
+                try:
+                    status = self.request(f"MenuStatus {menu_item}").lower()
+                except Exception:
+                    status = ""
+                if "disabled" in status:
+                    logging.info("A collection appears to be running already; "
+                                 "waiting for it instead of re-issuing.")
+                    self._wait_until_idle(menu_item)
+                    return
+
     def collect_background(self, title: str) -> None:
-        self.exec(f'CollectBackground "{title}" Auto Polling')
-        self._wait_until_idle("CollectBackground")
+        self._collect(f'CollectBackground "{title}" Auto Polling',
+                      "CollectBackground", f"background '{title}'")
 
     def collect_sample(self, title: str) -> None:
-        self.exec(f'CollectSample "{title}" Auto Polling')
-        self._wait_until_idle("CollectSample")
+        self._collect(f'CollectSample "{title}" Auto Polling',
+                      "CollectSample", f"sample '{title}'")
 
     def display(self) -> None:
         """Move newly-collected spectra from the invisible DDE window into
@@ -957,6 +1050,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             dry_run=args.dry_run,
             poll_interval_s=float(omnic_cfg.get("poll_interval_s", "2")),
             collect_timeout_s=float(omnic_cfg.get("collect_timeout_s", "1800")),
+            collect_retries=int(omnic_cfg.get("collect_retries", "2")),
+            retry_delay_s=float(omnic_cfg.get("retry_delay_s", "5")),
         ) as omnic:
             omnic.load_parameters(exp_file, keep_bkg=True)
 
