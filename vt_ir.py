@@ -168,6 +168,35 @@ class OmnicDDE:
             return
         self._conv.Exec(bracketed)
 
+    def exec_resilient(self, cmd: str, what: str) -> None:
+        """Like :meth:`exec` but for short preamble commands (e.g.
+        LoadParameters) that should survive a lingering DDE wedge left over
+        from a previous run.  On a failed Exec it reconnects the channel and
+        retries (using the same collect_retries / retry_delay_s knobs).  A
+        run once hard-crashed on LoadParameters because OMNIC was still wedged
+        from the prior aborted run; this recovers that case."""
+        attempts = self.collect_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self.exec(cmd)
+                return
+            except Exception as e:
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        f"OMNIC did not accept '{what}' after {attempts} "
+                        f"attempt(s) ({e}).\n"
+                        f"OMNIC may still be wedged from a previous run.  Bring "
+                        f"the OMNIC window to the front, dismiss any dialog, and "
+                        f"if it persists RESTART OMNIC, then re-run."
+                    ) from e
+                logging.warning("'%s' failed (%s).  Reconnecting and retrying "
+                                "(attempt %d of %d) ...", what, e, attempt, attempts)
+                time.sleep(self.retry_delay_s)
+                try:
+                    self.reconnect()
+                except Exception as re_err:
+                    logging.warning("DDE reconnect failed: %s", re_err)
+
     def request(self, item: str) -> str:
         """DDERequest -- read a parameter or Result item.  Returns a stripped,
         UTF-8 decoded string (pywin32 sometimes returns bytes, sometimes str)."""
@@ -260,7 +289,8 @@ class OmnicDDE:
         currently-set background so the BackgroundFileName poke we do later
         in sample mode is not blown away on the next iteration."""
         flags = " KeepBkg" if keep_bkg else ""
-        self.exec(f'LoadParameters "{exp_file}"{flags}')
+        self.exec_resilient(f'LoadParameters "{exp_file}"{flags}',
+                            "LoadParameters")
 
     # The collect_* helpers below use the Polling keyword so the pywin32 DDE
     # Exec call returns immediately and Python (not Windows DDE) controls the
@@ -579,6 +609,61 @@ def find_bg_file(bg_dir: Path, sample: str, T: int) -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
+def bg_age_days(path: Path) -> float:
+    """Age of a background file in days, from its last-modified time."""
+    try:
+        return max(0.0, (time.time() - path.stat().st_mtime) / 86400.0)
+    except OSError:
+        return 0.0
+
+
+def survey_sample_bgs(bg_dir: Path, sample: str) -> List[Tuple[int, Path]]:
+    """Every background for this sample as (temperature_C, path), one entry per
+    temperature (lowest-index file kept if duplicates), sorted by temperature.
+    Matches both indexed (NN_BG_...) and unindexed names."""
+    found: List[Tuple[int, Path]] = []
+    if bg_dir.exists():
+        for f in bg_dir.glob(f"*BG_{sample}_*C.SPA"):
+            m = _BG_FILE_RE.match(f.name)
+            if m and m.group("sample") == sample:
+                try:
+                    found.append((int(m.group("T")), f))
+                except ValueError:
+                    pass
+    found.sort(key=lambda tp: (tp[0], tp[1].name))
+    seen, uniq = set(), []
+    for t, p in found:
+        if t not in seen:
+            seen.add(t)
+            uniq.append((t, p))
+    return uniq
+
+
+def resolve_bg_plan(sample_temps: List[int],
+                    available: List[Tuple[int, Path]],
+                    mode: str,
+                    fixed_temp: Optional[int] = None
+                    ) -> Dict[int, Optional[Tuple[int, Path]]]:
+    """Decide which background each sample temperature will use.
+
+    Returns ``{T: (bg_temp, bg_path)}``.  In ``exact`` mode a temperature with
+    no exact-match BG maps to ``None`` (caller treats it as missing).
+    ``closest`` and ``fixed`` always resolve as long as ``available`` is
+    non-empty.  ``closest`` breaks ties toward the lower temperature."""
+    by_temp = {t: p for t, p in available}
+    avail_temps = [t for t, _ in available]
+    plan: Dict[int, Optional[Tuple[int, Path]]] = {}
+    for T in sample_temps:
+        if mode == "exact":
+            plan[T] = (T, by_temp[T]) if T in by_temp else None
+        elif mode == "fixed":
+            plan[T] = (fixed_temp, by_temp[fixed_temp]) if fixed_temp in by_temp else None
+        else:  # closest
+            bt = min(avail_temps, key=lambda a: (abs(a - T), a)) if avail_temps else None
+            plan[T] = (bt, by_temp[bt]) if bt is not None else None
+    return plan
+
+
 # Single source of truth for per-direction metadata used across the wizard
 # summary (glyph), the per-step log line (arrow), and analyse_live.py's
 # overlay shading (color, label).  Adding a new schedule kind means adding
@@ -650,11 +735,12 @@ def step_background(omnic: OmnicDDE, sample: str, T: int, out_dir: Path,
 
 
 def step_sample(
-    omnic: OmnicDDE, sample: str, T: int, out_dir: Path, bg_dir: Path,
+    omnic: OmnicDDE, sample: str, T: int, out_dir: Path, bg: Path,
     suffix: str = "", extra_formats: Optional[List[str]] = None,
     prefix: str = "",
 ) -> Tuple[Path, Path]:
-    """Per-T sample step.
+    """Per-T sample step.  ``bg`` is the pre-resolved background file to use
+    (chosen in the preflight according to the matching mode).
 
     OMNIC's Collect/BackgroundHandling + Collect/BackgroundFileName parameter
     pair would be the documented way to bind a saved BG file to the next
@@ -669,14 +755,7 @@ def step_sample(
         ->  CollectSample (ratios against the just-set background)
         ->  Display + Export + DeleteSelectedSpectra
     """
-    bg = find_bg_file(bg_dir, sample, T)
-    if bg is None:
-        raise FileNotFoundError(
-            f"Background file for {T} C is missing in {bg_dir}\n"
-            "Run mode 0 (Background) first with the same sample name and temperatures."
-        )
-
-    # 1) Bind the matching BG file as the current background.
+    # 1) Bind the chosen BG file as the current background.
     omnic.import_spectrum(str(bg))
     omnic.display()              # invisible DDE window -> active window, becomes selected
     omnic.set_as_background()    # current BG <- selected spectrum
@@ -839,10 +918,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     paths = cfg["paths"]
     defaults = cfg["defaults"]
     heater = cfg["heater"]
-    # [omnic], [live_plot], [export] sections are optional -- fall back to defaults.
+    # [omnic], [live_plot], [export], [backgrounds] sections are optional.
     omnic_cfg = cfg["omnic"] if cfg.has_section("omnic") else {}
     live_cfg = cfg["live_plot"] if cfg.has_section("live_plot") else {}
     export_cfg = cfg["export"] if cfg.has_section("export") else {}
+    bg_cfg = cfg["backgrounds"] if cfg.has_section("backgrounds") else {}
+    bg_max_age_days = float(bg_cfg.get("max_age_warn_days", "1"))
+    bg_default_mode = str(bg_cfg.get("match_mode", "exact")).strip().lower()
+    if bg_default_mode not in ("exact", "closest", "fixed"):
+        bg_default_mode = "exact"
 
     # Extra (non-.SPA) formats to write for every spectrum.  Parsed from a
     # comma-separated list of extensions; '.SPA' is always written regardless.
@@ -884,6 +968,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # at the starting temperature, so asking both would be redundant.
     down_scan = False
     return_to_start = False
+    bg_mode = "exact"
+    bg_fixed_temp: Optional[int] = None
     if mode == "1":
         down_scan = ask_choice(
             "Add a cool-down (down-scan) after heating, to check reversibility?",
@@ -895,6 +981,37 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "cooling? (quick reversibility check, no full down-scan)",
                 ["y", "n"], default="n",
             ) == "y"
+
+        # Background temperature matching.  Exact-temperature backgrounds are
+        # not strictly required (the cell sits in a controlled glovebox), so
+        # the user can fall back to the nearest available BG, or pin one BG
+        # for the whole run.  The actual plan + any age/mismatch warnings are
+        # logged in the preflight below.
+        print("\nBackground temperature matching:")
+        print("  exact   - use the BG collected at each sample temperature")
+        print("  closest - use the nearest-temperature BG available for each step")
+        print("  fixed   - use ONE background (you pick which) for every step")
+        bg_mode = ask_choice("Choose matching mode",
+                             ["exact", "closest", "fixed"], default=bg_default_mode)
+        if bg_mode == "fixed":
+            avail = survey_sample_bgs(
+                build_session_dir(
+                    Path(paths.get("bg_root", paths["output_root"])), sample),
+                sample)
+            if avail:
+                avail_temps = [t for t, _ in avail]
+                opts = ", ".join(str(t) for t in avail_temps)
+                while True:
+                    raw = ask(f"Which BG temperature to use for ALL steps? "
+                              f"Available: {opts}", str(avail_temps[0]))
+                    try:
+                        v = int(raw)
+                    except ValueError:
+                        v = None
+                    if v in avail_temps:
+                        bg_fixed_temp = v
+                        break
+                    print(f"  (choose one of: {opts})")
 
     exp_file = ask("OMNIC experiment file (.exp)",
                    defaults.get("omnic_exp_file", ""))
@@ -939,27 +1056,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.info("Extra export formats:  %s", ", ".join(extra_formats) or "(none, SPA only)")
     logging.info("Equilibration (s):     %d", equilibration)
     logging.info("Output folder:         %s", session_dir)
+    # bg_for_T maps each unique sample temperature to the BG file the run will
+    # use.  Built here (sample mode only) so the plan -- and every age/mismatch
+    # warning -- is logged once, up front, before the user confirms.
+    bg_for_T: Dict[int, Path] = {}
     if mode == "1":
         logging.info("Background folder:     %s", bg_dir)
-        # Backgrounds are keyed by unique temperature regardless of direction.
-        # find_bg_file matches both indexed and unindexed naming so it accepts
-        # BG sets collected before the index feature was added.
-        missing = [T for T in Ts if find_bg_file(bg_dir, sample, T) is None]
-        if missing:
+        logging.info("Background matching:   %s%s", bg_mode,
+                     f" (fixed at {bg_fixed_temp} C)" if bg_mode == "fixed" else "")
+        available = survey_sample_bgs(bg_dir, sample)
+
+        # No backgrounds at all for this sample -> the helpful "where are the
+        # BGs" guidance (unchanged), since no matching mode can rescue that.
+        if not available:
             msg = [
-                f"Missing BG files for sample {sample!r}: "
-                + ", ".join(f"{T} C" for T in missing),
+                f"No background files found for sample {sample!r}.",
                 f"Looked in:  {bg_dir}",
             ]
-            available = survey_bg_folders(bg_root)
-            # Strip out the sample we just tried so we don't suggest it back.
-            available.pop(sample, None)
-            if available:
+            others = survey_bg_folders(bg_root)
+            others.pop(sample, None)
+            if others:
                 msg.append("")
                 msg.append("Sample folders that DO have BG files:")
-                for name, temps in available.items():
-                    t_str = ", ".join(str(T) for T in temps)
-                    msg.append(f"  - {name}   ({t_str} C)")
+                for name, temps in others.items():
+                    msg.append(f"  - {name}   ({', '.join(str(t) for t in temps)} C)")
                 msg.append("")
                 msg.append(f"Either rerun BG mode first under name {sample!r}, "
                            f"or restart and pick one of the names above.")
@@ -968,6 +1088,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                 msg.append("No other sample folders have BG files either -- "
                            "you need to run BG mode first.")
             sys.exit("\n".join(msg))
+
+        plan = resolve_bg_plan(Ts, available, bg_mode, fixed_temp=bg_fixed_temp)
+
+        # In exact mode a missing temperature is fatal -- but now we point the
+        # user at the closest/fixed modes as a way to proceed anyway.
+        missing = [T for T in Ts if plan.get(T) is None]
+        if missing:
+            have = ", ".join(f"{t} C" for t, _ in available)
+            sys.exit(
+                f"Missing exact-temperature backgrounds for sample "
+                f"{sample!r}: {', '.join(f'{T} C' for T in missing)}.\n"
+                f"Available BG temperatures: {have}.\n"
+                f"Either run BG mode for the missing temperatures, or re-run "
+                f"and choose the 'closest' or 'fixed' matching mode to proceed "
+                f"with the backgrounds you already have."
+            )
+
+        # Log the full plan + warnings.  This is the audit trail: anyone asking
+        # later how a given measurement's background was chosen finds it here.
+        logging.info("Background plan (sample T -> BG used):")
+        for T in Ts:
+            bt, bpath = plan[T]
+            age = bg_age_days(bpath)
+            exact = (bt == T)
+            logging.info("  %4d C  ->  %d C BG   %-28s  (%.1f days old)%s",
+                         T, bt, bpath.name, age,
+                         "" if exact else "   [TEMPERATURE MISMATCH]")
+            if not exact:
+                logging.warning(
+                    "Background temperature mismatch at %d C: using a %d C "
+                    "background (off by %d C).", T, bt, abs(bt - T))
+            if age > bg_max_age_days:
+                logging.warning(
+                    "Background for %d C is %.1f days old (> %.1f day threshold): %s",
+                    T, age, bg_max_age_days, bpath.name)
+            bg_for_T[T] = bpath
     logging.info("Log file:              %s", log_file)
     logging.info("Specac exe:            %s", paths["specac_exe"])
     print()
@@ -1113,8 +1269,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     logging.info("Saved BG:  %s", out)
                     produced.append((T, out))
                 else:
-                    out, used_bg = step_sample(omnic, sample, T, session_dir, bg_dir,
-                                               suffix=suffix, extra_formats=extra_formats,
+                    out, used_bg = step_sample(omnic, sample, T, session_dir,
+                                               bg_for_T[T], suffix=suffix,
+                                               extra_formats=extra_formats,
                                                prefix=prefix)
                     logging.info("Saved sample:  %s  (BG = %s)", out, used_bg)
                     produced.append((T, out))

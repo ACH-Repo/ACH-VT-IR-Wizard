@@ -86,6 +86,14 @@ All temperatures are in °C and must fall within `[tmin, tmax]` from the config.
 - **Optional single return-to-start** — for users who want a lightweight
   reversibility check without a full down-scan pass; produces one extra
   `…_return.SPA` at the lowest temperature after the heating ramp.
+- **Flexible background matching** — backgrounds do *not* have to match the
+  sample temperature exactly (the cell sits in a controlled glovebox). Per
+  run you pick `exact`, `closest` (nearest available BG temperature per step),
+  or `fixed` (one chosen BG for every step). Temperature mismatches and
+  backgrounds older than `[backgrounds] max_age_warn_days` are **warned about
+  but never block the run** — and every such decision is written to the run
+  log so there's a clear record of exactly which background each measurement
+  used.
 - **Chronological filename index** — every spectrum gets a zero-padded
   prefix (`00_`, `01_`, …) so Explorer's name sort matches the order they
   were collected. Padding adapts to the schedule length.
@@ -267,10 +275,16 @@ like `tolerance_c = .5` in `vt_ir_config.ini`. Use `0.5` instead. (Recent
 versions of `vt_ir.py` normalize this automatically, but the underlying
 CLI is picky about it.)
 
-**`Missing BG files for sample …`** — the sample-mode preflight found no
-`BG_<sample>_<T>C.SPA` for one or more temperatures. The error message
-lists which other sample folders DO have BG files, in case you typed the
-name slightly wrong.
+**`No background files found for sample …`** — the sample-mode preflight
+found no `BG_<sample>_<T>C.SPA` at all for this sample. The message lists
+which other sample folders DO have BG files, in case you typed the name
+slightly wrong. (Run BG mode first if there genuinely are none.)
+
+**`Missing exact-temperature backgrounds for sample …`** — you chose the
+`exact` matching mode but at least one sample temperature has no BG at that
+exact temperature. Either collect the missing BGs, or re-run and pick the
+`closest` or `fixed` matching mode to proceed with the backgrounds you
+already have (mismatches are warned about and logged, not blocked).
 
 **`Specac reported 'setpoint reached' but cell is at X C`** — the
 controller's CLI returned from `sp T w` while the cell was still far from
@@ -278,19 +292,21 @@ controller's CLI returned from `sp T w` while the cell was still far from
 if it triggers anyway, close and reopen the Specac controller GUI to fully
 clear it, then re-run.
 
-**`OMNIC did not accept 'sample …' after N attempt(s)` / repeated
-collections fail to start** — OMNIC accepted the file/display commands
-(Import, SetAsBackground) but could not *start* the actual collection. The
-DDE channel is fine; the **iS5 bench is wedged** — a dialog is open in
-OMNIC, a scan is already running, or (most common) the spectrometer has
-dropped offline. The orchestrator reconnects and retries `collect_retries`
-times first; if that fails it aborts with this message. **Fix: restart
-OMNIC.** The bench can stay wedged across runs until OMNIC is restarted —
-which is why re-running without restarting keeps failing on the very first
-collection. If it recurs specifically during a long passive cool-down,
-the lengthening gap between scans may be letting the bench idle out;
-restarting OMNIC before the sample pass and keeping an eye on the first
-down-scan collection is the practical workaround.
+**`OMNIC did not accept 'sample …' / 'LoadParameters' after N attempt(s)` /
+repeated collections fail to start** — OMNIC accepted the file/display
+commands (Import, SetAsBackground) but could not *start* the actual
+collection — or a fresh run failed immediately on `LoadParameters`. The DDE
+channel is fine; the **iS5 bench is wedged** — a dialog is open in OMNIC, a
+scan is already running, or (most common) the spectrometer has dropped
+offline. The orchestrator reconnects and retries `collect_retries` times
+first (this now also covers the `LoadParameters` preamble, so a run started
+right after a wedged one gets a chance to recover); if that fails it aborts
+with this message. **Fix: restart OMNIC.** The bench can stay wedged across
+runs until OMNIC is restarted — which is why re-running without restarting
+keeps failing on the very first command. If it recurs specifically during a
+long passive cool-down, the lengthening gap between scans may be letting the
+bench idle out; restarting OMNIC before the sample pass and keeping an eye on
+the first down-scan collection is the practical workaround.
 
 **`dde.error: Exec failed` mid-collection** — the underlying pywin32 error
 behind the message above (pywin32's DDE Exec has a hard 60 s transaction
