@@ -5,7 +5,7 @@ heated Golden Gate ATR** from a single process — turning a heater + spectromet
 from two different manufacturers into one variable-temperature IR experiment
 with chronologically-indexed output files and a live overlay plot.
 
-<!-- TODO: replace with a screenshot of analyse_live.py running alongside a
+<!-- TODO: replace with a screenshot of the live plots running alongside a
      real VT-IR experiment.  Best frame: the temperature/setpoint trace already
      covers a few steps so the shaded scan bands (BG = blue, up = red,
      down = orange, return = green) are clearly visible. -->
@@ -14,14 +14,24 @@ with chronologically-indexed output files and a live overlay plot.
 ## Quick start
 
 ```
-pip install pywin32 matplotlib
+pip install vtir-wizard
 ```
 
-1. Open `vt_ir_config.ini` and replace every `<you>` with your Windows user name (and adjust the paths if your data lives elsewhere).
+1. Create your editable config and fill it in:
+   ```
+   vtir-wizard --init-config
+   ```
+   This drops a commented `vt_ir_config.ini` in `%APPDATA%\vtir-wizard\` and
+   prints the path. Open it, replace every `<you>` with your Windows user name,
+   and adjust the paths if your data lives elsewhere.
 2. Open OMNIC (the DDE conversation needs it running).
-3. Double-click `run_vt_ir.bat`.
+3. Run it from any terminal:
+   ```
+   vtir-wizard
+   ```
+   (or double-click `run_vt_ir.bat`).
 
-The script asks for the sample name, mode (background or sample), temperatures,
+The wizard asks for the sample name, mode (background or sample), temperatures,
 and a couple of optional measurement modifiers. After you confirm, it
 **(a)** drives the Specac controller temperature-by-temperature via its CLI,
 **(b)** waits for the cell to actually reach each setpoint,
@@ -29,9 +39,26 @@ and a couple of optional measurement modifiers. After you confirm, it
 **(d)** exports it as both `.SPA` and a plotting-friendly format
 (`.csv` by default).
 
-A separate console window opens automatically with a live overlay plot —
-temperature and setpoint trace from the Specac log file, with each completed
-scan shaded onto the timeline.
+Two console windows open automatically alongside the run: a **temperature
+overlay** (temperature/setpoint trace with each completed scan shaded onto the
+timeline) and a **live IR stack** (a temperature-colored waterfall of the
+spectra themselves, growing as each scan lands).
+
+> **One-time OMNIC setup (avoids a mid-run hang).** In the OMNIC experiment
+> (`.exp`) you load, open *Experiment Setup → Collect* and set **Background
+> handling** to **"Collect background after N minutes"** with **N = 999999**,
+> then **Save** it back into that `.exp`. Otherwise — if it is left on "Collect
+> background before every measurement" — OMNIC stops to ask "the background is
+> old, collect a new one?" before each sample, and that modal blocks the DDE
+> call and hangs the run. The wizard also forces this over DDE every run as a
+> safety net, but saving it in the `.exp` is the durable fix. See
+> [How it works](#how-it-works).
+
+Once the run is finished, plot the spectra themselves with the companion
+**[ACH-VT-IR-Plotter](https://github.com/ACH-Repo/ACH-VT-IR-Plotter)** — point
+it at the session folder for an overlay, a fixed-offset waterfall, or split
+heating/cooling panels. It reads OMNIC `.SPA` natively, so no CSV export is
+needed.
 
 ## What you'll see
 
@@ -106,7 +133,14 @@ All temperatures are in °C and must fall within `[tmin, tmax]` from the config.
 - **Robust against stuck-Wait state on the Specac controller** — sends an
   explicit `off` → `on` at start, queries `temp?` after every `sp T w`, and
   aborts before OMNIC collects at the wrong temperature.
-- **Live overlay plot** — auto-launches alongside the orchestrator and
+- **No mid-run hang on stale backgrounds** — the wizard forces OMNIC's
+  background handling to "reuse the current background" (`BackgroundHandling =
+  AfterTime` with a very large `MaxBackgroundAge`) over DDE at the start of
+  every run, so a day-old background never triggers the "collect a new one?"
+  modal that would otherwise block the DDE call and stall the run. The age (in
+  minutes) is the `[backgrounds] max_bg_age_min` config knob. Pair it with the
+  matching one-time `.exp` setting (see Quick start) for the durable fix.
+- **Live temperature overlay** — auto-launches alongside the orchestrator and
   re-reads the Specac log + the session folder every few seconds. It is
   scoped to the current run (the background pass and the sample pass don't
   pile into one cramped image), preserves your zoom across refreshes (press
@@ -114,17 +148,40 @@ All temperatures are in °C and must fall within `[tmin, tmax]` from the config.
   finishes plus `save_delay_s` (default 10 min, to capture the cool-down
   tail), and again on manual window close. Snapshots land in
   `<plot_dir>/<sample>/<sample>_<BG|SAMPLE>_<timestamp>.svg`.
+- **Live IR stack** — a second auto-launched window that re-reads the session's
+  `.SPA` files as they land and re-draws a temperature-colored waterfall of
+  every scan so far (or an `overlay`, per `[ir_plot] mode`). After each new scan
+  it overwrites a single SVG at `<plot_dir>/<sample>/<sample>_IR_stack.svg`, so
+  only the final stacked spectrum persists. Reads OMNIC `.SPA` natively (readers
+  shared with the companion plotter). Configure layout/unit in the `[ir_plot]`
+  config section; suppress with `--no-ir-plot` (or both windows with
+  `--no-live-plot`).
+- **Companion spectrum plotter** — where the live overlay tracks *temperature
+  vs. time* during a run, the separate
+  [**ACH-VT-IR-Plotter**](https://github.com/ACH-Repo/ACH-VT-IR-Plotter) turns
+  the collected spectra into a publication-ready figure afterwards: overlay /
+  fixed-offset waterfall / split heating–cooling panels, with the scan
+  direction and temperature read straight from the wizard's filename
+  convention and Absorbance-vs-Transmittance detected automatically. Reads
+  OMNIC `.SPA` directly, so the `.csv` export is optional.
 - **Tracebacks land in the run log** — if something blows up at 3 AM, the
   full traceback is in the same `.log` file as the call history that
   preceded it.
 
 ## Installation
 
+```
+pip install vtir-wizard
+```
+
+then `vtir-wizard --init-config` to write an editable `vt_ir_config.ini` to
+`%APPDATA%\vtir-wizard\`. To update later: `pip install --upgrade vtir-wizard`.
+
+`pip` pulls in `matplotlib`, `numpy`, and (on Windows) `pywin32` automatically.
+
 Requirements:
 
-- Python 3.10+
-- `pywin32` (DDE bindings) — `pip install pywin32`
-- `matplotlib` (for `analyse_live.py`) — `pip install matplotlib`
+- Python 3.9+ on Windows (the DDE/`pywin32` path is Windows-only).
 - Specac USB Temperature Controller software **v1.0.23.0 or later** (the CLI
   was added in this version). Confirm with `specac.cmd temp?` in a terminal.
 - Thermo OMNIC. Any version that supports DDE (i.e. ≥ 6.0).
@@ -132,17 +189,34 @@ Requirements:
 Tested combination: OMNIC + Nicolet iS5 + Specac heated Golden Gate ATR +
 Specac controller software v1.0.23.0+.
 
+**From a source checkout** (development): `pip install -e .` from the repo root,
+or run without installing via `run_vt_ir.bat` (it puts `src/` on `PYTHONPATH`).
+
+### Config file resolution
+
+`vtir-wizard` looks for `vt_ir_config.ini` in this order: an explicit
+`--config <path>`, then `./vt_ir_config.ini` in the current folder, then the
+per-user `%APPDATA%\vtir-wizard\vt_ir_config.ini`. So you can keep a global
+default and override it per-experiment by dropping a config in the working
+folder.
+
 ## Project layout
 
 ```
 ACH-VT-IR-Wizard/
-├── vt_ir.py              the orchestrator
-├── analyse_live.py       live-updating overlay plot
-├── vt_ir_config.ini      machine-specific paths and defaults
-├── run_vt_ir.bat         double-click launcher for the orchestrator
-├── run_analyse_live.bat  double-click launcher for the plot (standalone use)
-├── README.md             you are here
-├── LICENSE               MIT
+├── pyproject.toml              packaging metadata (entry point: vtir-wizard)
+├── src/vtir_wizard/
+│   ├── __init__.py             version + shared SCHEDULE_KINDS table
+│   ├── orchestrator.py         the run wizard (the `vtir-wizard` command)
+│   ├── temp_plot.py            live temperature/setpoint overlay window
+│   ├── ir_plot.py              live stacked-IR-spectrum window
+│   ├── spectra_io.py           native .SPA/.csv/.jdx readers + styling
+│   ├── config.py               config discovery + --init-config
+│   └── data/vt_ir_config.ini   bundled config template
+├── run_vt_ir.bat               double-click launcher for the wizard
+├── run_analyse_live.bat        double-click launcher for a plot (standalone)
+├── README.md                   you are here
+├── LICENSE                     MIT
 └── .gitignore
 ```
 
@@ -184,7 +258,7 @@ timings.
 
 The controller has been observed returning from `sp T w` while the cell was
 still far from `T` (a stuck "Wait" state left over from a previous `.prog`
-session). To defend against that, `vt_ir.py` sends an explicit `off` before
+session). To defend against that, the wizard sends an explicit `off` before
 `on` in its preamble and queries `temp?` after every wait — if the reading
 is more than `tolerance + 5 °C` from the setpoint, the run aborts before
 OMNIC starts a doomed collection.
@@ -210,13 +284,28 @@ OMNIC's DDE interface (manual: `OMNIC DDE.pdf`, app name `OMNIC`, topic
   [Import "<bg.spa>"] -> [Display] -> [SetAsBackground]
   -> [DeleteSelectedSpectra] -> [CollectSample …]
   ```
+- **Defeating the "background is old — collect a new one?" prompt.** If the
+  experiment's *Background handling* is left on "Collect background before every
+  measurement" (`BackgroundHandling = BeforeCol`), OMNIC pops a modal asking to
+  confirm reuse of the bound (old) background before each sample. The modal
+  blocks the DDE `Exec` (the same 60 s timeout), so the wizard never gets its
+  ack and the run hangs in "Still waiting for CollectSample". The fix is
+  `BackgroundHandling = AfterTime` with a very large `MaxBackgroundAge` (minutes)
+  — "the current background is young enough, just use it" — which the wizard
+  sets over DDE right after `LoadParameters` (best-effort; logged and read back
+  for the audit trail). Because the iS5 build can reject parameter writes, the
+  **durable** fix is to also select "Collect background after N minutes" with
+  N = `max_bg_age_min` in the `.exp` and save it; the DDE write is the
+  belt-and-suspenders. (DDE manual, Collect group: `BackgroundHandling` ∈
+  `{BeforeCol, AfterCol, AfterTime, ThisBkg}`; `MaxBackgroundAge` = integer
+  minutes, consulted only in `AfterTime` mode.)
 - **Without `Invoke`, collected spectra land in OMNIC's invisible DDE
   window.** A `[Display]` before `[Export]` makes the new spectrum the
   active/selected one so Export saves what we just collected.
 
 ### The orchestrator side
 
-The per-step body in `vt_ir.py` follows the same shape regardless of mode:
+The per-step body in the wizard follows the same shape regardless of mode:
 
 ```
 specac.cmd sp <T> w      # heat to T, block until reached
@@ -272,7 +361,7 @@ OMNIC opens — so no spectra are collected at the wrong temperature.
 **`Specac CLI refused the command. … Received Invalid Value`** — Specac
 rejected a numeric argument. Most common cause: a leading decimal point
 like `tolerance_c = .5` in `vt_ir_config.ini`. Use `0.5` instead. (Recent
-versions of `vt_ir.py` normalize this automatically, but the underlying
+versions of the wizard normalize this automatically, but the underlying
 CLI is picky about it.)
 
 **`No background files found for sample …`** — the sample-mode preflight
@@ -317,7 +406,62 @@ retry/reconnect logic; see the entry above.
 `specac.cmd off` on every exit path, including Ctrl-C. If you killed the
 process hard, run `specac.cmd off` manually in a terminal.
 
+**Run hangs at "Still waiting for CollectSample" with an OMNIC dialog open** —
+OMNIC is asking whether to collect a fresh background (its *Background handling*
+is on "before every measurement"). The wizard already forces
+`BackgroundHandling = AfterTime` + a huge `MaxBackgroundAge` over DDE, but if
+that write is rejected by your build the dialog can still appear. Fix it at the
+source: in the experiment's *Collect → Background handling*, choose "Collect
+background after N minutes" with N = 999999 and **Save** the `.exp`. Dismiss the
+open dialog with **No** to let the current run continue.
+
+**`No vt_ir_config.ini found`** — run `vtir-wizard --init-config` to create the
+per-user config (the path is printed), edit it, then re-run. Or pass an explicit
+`--config <path>`.
+
+**A cool-down step times out / `subprocess.TimeoutExpired` on `sp <T> w`** — the
+cell could not reach the setpoint within `[heater] ramp_timeout_s`. Heating is
+fast, but **cooling is passive** and slows as it nears the glovebox ambient, so
+the bottom of a down-scan (e.g. 60 → 40 °C) can take a very long time — or be
+unreachable if the target is too close to ambient. As of v1.4.3 the wizard
+**logs a warning, skips that step, and finishes cleanly** (keeping every spectrum
+already collected, heater switched off) instead of aborting. To actually capture
+the step, check the temperature-overlay plot for that interval: if the curve was
+still descending, raise `ramp_timeout_s` (e.g. `7200` = 2 h); if it plateaued
+above the target, passive cooling can't reach it — keep the down-scan's lowest
+temperature higher, or widen `[heater] tolerance_c` (e.g. `2`–`3`) so "reached"
+triggers a couple degrees early.
+
+**Specac `Access is denied` at `SendKeys.SendInput` (often over Remote Desktop)**
+— the Specac CLI drives its own GUI by injecting simulated keystrokes, and
+Windows blocks that when the session is **locked or the RDP session is
+disconnected**. You'll see `Unhandled Exception: …Win32Exception: Access is
+denied … SendKeys.SendInput` in the log. It may or may not stall the run, but it
+means the remote desktop went non-interactive. **Keep the remote session
+connected and unlocked for the whole run** (don't disconnect RDP mid-run); for
+long unattended runs, run on the physical console or keep the console session
+active so synthetic input is allowed.
+
 </details>
+
+## Building and publishing (maintainers)
+
+The package builds with [hatchling](https://hatch.pypa.io/). From the repo root:
+
+```
+pip install build twine
+python -m build                 # writes dist/vtir_wizard-<ver>-py3-none-any.whl + .tar.gz
+pip install dist/*.whl          # smoke-test the wheel in a fresh venv
+twine upload dist/*             # upload to PyPI (needs your PyPI API token)
+```
+
+To validate the listing first, upload to TestPyPI:
+`twine upload --repository testpypi dist/*`, then
+`pip install -i https://test.pypi.org/simple/ vtir-wizard`.
+
+Bump `__version__` in `src/vtir_wizard/__init__.py` before each release (the
+build reads the version from there). Confirm the `vtir-wizard` name is available
+on PyPI before the first upload.
 
 ## Authorship and history
 
@@ -334,7 +478,10 @@ Specific user-visible features added during the rewrite:
 - Single-process orchestration via DDE + Specac CLI (no parallel macros).
 - Per-temperature background binding via `Import` + `SetAsBackground`.
 - Polling-based long-collection support.
-- Live overlay plot (`analyse_live.py`) auto-launched alongside the run.
+- Live temperature overlay (`temp_plot`) + live stacked-IR-spectrum window
+  (`ir_plot`) auto-launched alongside the run.
+- Packaged for PyPI as `vtir-wizard` (single console command, per-user config).
+- OMNIC background-aging forced over DDE so stale backgrounds never hang a run.
 - Optional cool-down and optional single return-to-start measurement.
 - Chronological filename indices, configurable extra export formats.
 - Sanity-checked Specac waits, traceback-routed log files.

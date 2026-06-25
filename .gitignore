@@ -8,6 +8,12 @@ __pycache__/
 venv/
 env/
 
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
 # IDE / editor
 .vscode/
 .idea/

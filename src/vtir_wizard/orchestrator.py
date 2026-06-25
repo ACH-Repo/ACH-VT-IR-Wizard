@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-vt_ir.py  --  Variable-temperature IR orchestrator
+vtir_wizard.orchestrator  --  Variable-temperature IR orchestrator
             for Thermo Nicolet iS5  +  Specac heated Golden Gate ATR
                                    +  Specac USB temperature controller.
+
+Installed as the ``vtir-wizard`` console command (see pyproject.toml).
 
 The two instruments come from different manufacturers and cannot talk to
 each other directly.  This script drives both from one process:
@@ -26,15 +28,16 @@ Workflow (always two passes per experiment):
     The two passes are separated by the cooldown of the heated cell --
     no manual sample swap at temperature, no parallel-process timing.
 
-Lab-specific paths live in  vt_ir_config.ini  next to this script.
+Lab-specific paths live in  vt_ir_config.ini, resolved (in order) from
+--config, the current folder, then %APPDATA%/vtir-wizard/  (see config.py).
+Run  vtir-wizard --init-config  to drop an editable template in place.
 
-Requires:  Python 3.10+, pywin32 (for DDE).  Tested against OMNIC's 2002
+Requires:  Python 3.9+, pywin32 (for DDE).  Tested against OMNIC's 2002
 DDE manual; should work on OMNIC 6.0 and later.
 """
 from __future__ import annotations
 
 import argparse
-import configparser
 import datetime as dt
 import logging
 import re
@@ -45,8 +48,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from . import SCHEDULE_KINDS, __version__
+from . import config as appconfig
 
-CONFIG_FILE = Path(__file__).with_name("vt_ir_config.ini")
+
 LOG_FORMAT = "%(asctime)s  %(levelname)-7s  %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
@@ -292,6 +297,50 @@ class OmnicDDE:
         self.exec_resilient(f'LoadParameters "{exp_file}"{flags}',
                             "LoadParameters")
 
+    def set_background_aging(self, max_age_min: str) -> None:
+        """Force OMNIC to reuse the currently-set background instead of prompting
+        to collect a new one because it is "old".
+
+        The lab .exp historically shipped with ``BackgroundHandling = BeforeCol``
+        ("collect a background before every measurement"), which makes OMNIC stop
+        and ask for confirmation before each DDE ``CollectSample`` once its
+        session timer elapses.  That modal blocks the DDE ``Exec`` (pywin32's
+        60 s timeout), so the wizard never gets its ack and the run hangs in
+        "Still waiting for CollectSample".
+
+        Setting ``BackgroundHandling = AfterTime`` with a very large
+        ``MaxBackgroundAge`` (in minutes) tells OMNIC "the current background is
+        young enough -- just use it", so no prompt ever appears.  (OMNIC DDE
+        manual, Collect group: ``BackgroundHandling`` is one of
+        ``BeforeCol | AfterCol | AfterTime | ThisBkg``; ``MaxBackgroundAge`` is an
+        integer number of minutes, consulted only in ``AfterTime`` mode.)
+
+        Best-effort and non-fatal: the experiment's *saved* .exp is the primary
+        fix; if this build rejects the DDE write we log a warning and rely on the
+        .exp.  Must run while no collection is in progress (the manual notes it is
+        illegal to set Collect parameters mid-collection), i.e. right after
+        :meth:`load_parameters`.
+        """
+        try:
+            self.set_param("Collect", "BackgroundHandling", "AfterTime")
+            self.set_param("Collect", "MaxBackgroundAge", str(max_age_min))
+        except Exception as e:
+            logging.warning(
+                "Could not set OMNIC background-aging parameters over DDE (%s).  "
+                "Relying on the saved .exp instead -- make sure the experiment "
+                "file has 'Background after %s minutes' (AfterTime) selected and "
+                "saved.", e, max_age_min)
+            return
+        # Read back for the audit trail (non-fatal if the build doesn't echo them).
+        try:
+            handling = self.request("Collect BackgroundHandling")
+            age = self.request("Collect MaxBackgroundAge")
+            if handling or age:
+                logging.info("OMNIC background handling: %s  (MaxBackgroundAge=%s min).",
+                             handling or "?", age or "?")
+        except Exception as e:
+            logging.debug("Could not read back background-aging params: %s", e)
+
     # The collect_* helpers below use the Polling keyword so the pywin32 DDE
     # Exec call returns immediately and Python (not Windows DDE) controls the
     # wait via _wait_until_idle.  This is the only reliable way to handle
@@ -424,6 +473,11 @@ class Specac:
         # Latest stdout-or-stderr; preserved so error messages can include
         # what Specac literally said, in addition to the orchestrator's hint.
         self.last_output: str = ""
+        # In dry-run we have no real controller, so remember the last requested
+        # setpoint and report it back from get_temp() -- otherwise the preflight
+        # "did we reach the setpoint?" probe sees None and aborts, and --dry-run
+        # never gets to exercise the OMNIC half of the run.
+        self._dry_last_sp: Optional[float] = None
 
     def _check_fatal(self, blob: str) -> None:
         """Raise RuntimeError if the Specac response contains any pattern
@@ -496,6 +550,7 @@ class Specac:
 
     def goto_and_wait(self, T: float, timeout: float = 3600.0) -> None:
         """Set setpoint and block until reached (within tolerance)."""
+        self._dry_last_sp = float(T)
         self._run("sp", self._fmt(T), "w", timeout=timeout)
 
     # Pattern matches the first signed decimal number in a string, with
@@ -504,6 +559,11 @@ class Specac:
     _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
     def get_temp(self) -> Optional[float]:
+        if self.dry_run:
+            # No real controller in dry-run: report the last requested setpoint
+            # (or a plausible room temperature before the first ramp) so the
+            # preflight sanity checks pass and the whole flow is exercised.
+            return self._dry_last_sp if self._dry_last_sp is not None else 25.0
         out = self._run("temp?")
         if not out:
             return None
@@ -664,22 +724,10 @@ def resolve_bg_plan(sample_temps: List[int],
     return plan
 
 
-# Single source of truth for per-direction metadata used across the wizard
-# summary (glyph), the per-step log line (arrow), and analyse_live.py's
-# overlay shading (color, label).  Adding a new schedule kind means adding
-# one row here -- not editing four sites.  Background ("bg") is also listed
-# even though it isn't a step direction, because analyse_live shades BG
-# scans too.
-SCHEDULE_KINDS = {
-    "up":     {"glyph": "^", "arrow": "Heating up to",
-               "color": (1.0, 0.2, 0.2, 0.22), "label": "Sample (up)"},
-    "down":   {"glyph": "v", "arrow": "Cooling down to",
-               "color": (1.0, 0.6, 0.0, 0.25), "label": "Sample (down)"},
-    "return": {"glyph": "*", "arrow": "Cooling back to starting temperature",
-               "color": (0.2, 0.7, 0.2, 0.28), "label": "Sample (return)"},
-    "bg":     {"glyph": "B", "arrow": "(background, not a step)",
-               "color": (0.2, 0.2, 1.0, 0.18), "label": "Background"},
-}
+# SCHEDULE_KINDS (per-direction glyph/arrow/color/label) is the single source of
+# truth shared with the live plots; it lives in vtir_wizard/__init__.py and is
+# imported at the top of this module so the plot subprocesses can pull it in
+# without importing the orchestrator's pywin32 dependency.
 
 
 def build_schedule(temps: List[int], down_scan: bool,
@@ -813,6 +861,24 @@ def survey_bg_folders(bg_root: Path) -> Dict[str, List[int]]:
     return out
 
 
+def _spawn_console(cmd: List[str], what: str, sample: str) -> Optional[subprocess.Popen]:
+    """Popen ``cmd`` in its own console window (Windows) so the child's prints
+    don't tangle with the orchestrator's prompts.  Returns the handle, or None on
+    failure.  The orchestrator never terminates these -- the user closes the plot
+    windows when they're done with them."""
+    kwargs = {}
+    if sys.platform == "win32":
+        # CREATE_NEW_CONSOLE = 0x00000010
+        kwargs["creationflags"] = 0x00000010
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        logging.info("Spawned %s  (pid=%d, sample=%s).", what, proc.pid, sample)
+        return proc
+    except Exception as e:
+        logging.warning("Could not spawn %s: %s", what, e)
+        return None
+
+
 def spawn_live_plot(sample: str,
                     config_path: Path,
                     live_cfg,
@@ -822,25 +888,18 @@ def spawn_live_plot(sample: str,
                     done_file: Path,
                     plot_dir: Path,
                     save_delay_s: str) -> Optional[subprocess.Popen]:
-    """Spawn analyse_live.py in a fresh console window, locked onto this
-    run's sample folder.  Returns the Popen handle, or None if spawning was
-    skipped or failed.  The orchestrator does NOT terminate the plotter on
-    exit -- the user closes the plot window when they're done with it.
+    """Spawn the temperature/setpoint overlay (``vtir_wizard.temp_plot``) in a
+    fresh console window, locked onto this run's sample folder.
 
     The extra arguments let the plotter (a) clip its view to just this run
-    (``--since``), (b) auto-save an SVG once the run finishes -- detected via
-    the ``--done-file`` the orchestrator writes in its finally block -- and
-    name it by mode (``--label``)."""
+    (``--since``), (b) auto-save an SVG once the run finishes -- detected via the
+    ``--done-file`` the orchestrator writes in its finally block -- and name it by
+    mode (``--label``)."""
     if dry_run:
-        logging.info("[dry-run] would spawn analyse_live.py for sample %r.", sample)
-        return None
-    script = Path(__file__).with_name("analyse_live.py")
-    if not script.exists():
-        logging.warning("Live plot script not found at %s -- skipping auto-launch.",
-                        script)
+        logging.info("[dry-run] would spawn temperature overlay plot for sample %r.", sample)
         return None
     cmd = [
-        sys.executable, str(script),
+        sys.executable, "-m", "vtir_wizard.temp_plot",
         "--config", str(config_path),
         "--sample", sample,
         "--interval", str(live_cfg.get("interval_s", "5")),
@@ -851,19 +910,41 @@ def spawn_live_plot(sample: str,
         "--plot-dir", str(plot_dir),
         "--save-delay", str(save_delay_s),
     ]
-    kwargs = {}
-    if sys.platform == "win32":
-        # CREATE_NEW_CONSOLE = 0x00000010 -- give the plotter its own console
-        # window so its prints don't tangle with the orchestrator's prompts.
-        kwargs["creationflags"] = 0x00000010
-    try:
-        proc = subprocess.Popen(cmd, **kwargs)
-        logging.info("Spawned live overlay plot  (pid=%d, sample=%s).",
-                     proc.pid, sample)
-        return proc
-    except Exception as e:
-        logging.warning("Could not spawn live overlay plot: %s", e)
+    return _spawn_console(cmd, "temperature overlay plot", sample)
+
+
+def spawn_ir_plot(sample: str,
+                  config_path: Path,
+                  ir_cfg,
+                  dry_run: bool,
+                  since_iso: str,
+                  mode_label: str,
+                  done_file: Path,
+                  plot_dir: Path) -> Optional[subprocess.Popen]:
+    """Spawn the live stacked-IR-spectrum window (``vtir_wizard.ir_plot``) in a
+    fresh console window, locked onto this run's sample folder.  It re-reads the
+    session's ``.SPA`` files as they land, stacks them by temperature, and
+    overwrites a single SVG in ``plot_dir`` so only the final stacked spectrum
+    persists (parallel to the temperature overlay's snapshot)."""
+    if dry_run:
+        logging.info("[dry-run] would spawn IR stack plot for sample %r.", sample)
         return None
+    cmd = [
+        sys.executable, "-m", "vtir_wizard.ir_plot",
+        "--config", str(config_path),
+        "--sample", sample,
+        "--interval", str(ir_cfg.get("interval_s", "5")),
+        "--mode", str(ir_cfg.get("mode", "stack")),
+        "--unit", str(ir_cfg.get("unit", "A")),
+        "--since", since_iso,
+        "--label", mode_label,
+        "--done-file", str(done_file),
+        "--plot-dir", str(plot_dir),
+    ]
+    offset = str(ir_cfg.get("offset", "")).strip()
+    if offset:
+        cmd += ["--offset", offset]
+    return _spawn_console(cmd, "IR stack plot", sample)
 
 
 def build_session_dir(out_root: Path, sample: str) -> Path:
@@ -886,44 +967,66 @@ def configure_logging(log_dir: Path, sample: str, mode_label: str,
     return log_file
 
 
-def load_config(path: Path) -> configparser.ConfigParser:
-    if not path.exists():
-        raise SystemExit(
-            f"Missing config file: {path}\n"
-            "Copy vt_ir_config.ini next to vt_ir.py and fill in the paths."
-        )
-    cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
-    cfg.read(path, encoding="utf-8")
-    return cfg
-
-
 def banner() -> None:
     print("=" * 66)
-    print("  VT-IR Orchestrator   --   iS5  +  Specac heated Golden Gate")
+    print(f"  VT-IR Orchestrator  v{__version__}   --   iS5  +  Specac heated Golden Gate")
     print("=" * 66)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="VT-IR measurement orchestrator.")
-    p.add_argument("--config", default=str(CONFIG_FILE),
-                   help="Path to vt_ir_config.ini (default: next to this script).")
+    p = argparse.ArgumentParser(
+        prog="vtir-wizard",
+        description="VT-IR measurement orchestrator (iS5 + Specac heated Golden Gate).",
+    )
+    p.add_argument("--config", default=None,
+                   help="Path to vt_ir_config.ini.  Default search order: this "
+                        "flag, then ./vt_ir_config.ini, then the per-user copy "
+                        "under %%APPDATA%%/vtir-wizard.")
+    p.add_argument("--init-config", action="store_true",
+                   help="Write a template vt_ir_config.ini to the per-user config "
+                        "folder (%%APPDATA%%/vtir-wizard) and exit.")
+    p.add_argument("--force", action="store_true",
+                   help="With --init-config, overwrite an existing per-user config.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print every DDE / Specac call without executing them.")
     p.add_argument("--no-live-plot", action="store_true",
-                   help="Skip auto-launching the analyse_live.py overlay plot, "
-                        "regardless of the [live_plot] config setting.")
+                   help="Skip auto-launching BOTH live plot windows (temperature "
+                        "overlay and IR stack), regardless of config.")
+    p.add_argument("--no-ir-plot", action="store_true",
+                   help="Skip only the live IR stack window (keep the temperature "
+                        "overlay).")
+    p.add_argument("--version", action="version",
+                   version=f"vtir-wizard {__version__}")
     args = p.parse_args(argv)
 
-    cfg = load_config(Path(args.config))
+    # --init-config short-circuits before any config is required.
+    if args.init_config:
+        dest, written = appconfig.init_user_config(force=args.force)
+        if written:
+            print(f"Wrote config template to:\n    {dest}\n"
+                  "Edit it (paths, defaults) and re-run  vtir-wizard.")
+        else:
+            print(f"Config already exists:\n    {dest}\n"
+                  "Edit it, or pass --force to overwrite with a fresh template.")
+        return 0
+
+    cfg_path = appconfig.resolve_config_path(args.config)
+    if cfg_path is None:
+        raise SystemExit(appconfig.missing_config_message())
+    cfg = appconfig.load_config(cfg_path)
     paths = cfg["paths"]
     defaults = cfg["defaults"]
     heater = cfg["heater"]
     # [omnic], [live_plot], [export], [backgrounds] sections are optional.
     omnic_cfg = cfg["omnic"] if cfg.has_section("omnic") else {}
     live_cfg = cfg["live_plot"] if cfg.has_section("live_plot") else {}
+    ir_cfg = cfg["ir_plot"] if cfg.has_section("ir_plot") else {}
     export_cfg = cfg["export"] if cfg.has_section("export") else {}
     bg_cfg = cfg["backgrounds"] if cfg.has_section("backgrounds") else {}
     bg_max_age_days = float(bg_cfg.get("max_age_warn_days", "1"))
+    # Minutes written to OMNIC's Collect/MaxBackgroundAge so the "background is
+    # old -- collect a new one?" prompt never fires (see omnic.set_background_aging).
+    bg_max_age_min = str(bg_cfg.get("max_bg_age_min", "999999")).strip()
     bg_default_mode = str(bg_cfg.get("match_mode", "exact")).strip().lower()
     if bg_default_mode not in ("exact", "closest", "fixed"):
         bg_default_mode = "exact"
@@ -1132,33 +1235,59 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info("Aborted by user.")
         return 1
 
-    # -- spawn live overlay plot (in its own window) ----------------------
-    # Done AFTER the Ready prompt so a plot window doesn't pop up while the
-    # user is still typing answers, and locked onto the just-confirmed sample.
-    # done_file stays None unless we actually spawn a plotter; it's the
-    # per-run sentinel the plotter watches to know when to auto-save its SVG.
+    # -- spawn live plot windows (each in its own console) ----------------
+    # Done AFTER the Ready prompt so windows don't pop up while the user is still
+    # typing answers, and locked onto the just-confirmed sample.  Two windows:
+    # the temperature/setpoint overlay and the stacked-IR-spectrum plot.  Both
+    # watch the same per-run ``done_file`` sentinel (written in the finally block)
+    # to know when the run is over.  done_file stays None unless at least one
+    # window is launched.
     done_file: Optional[Path] = None
-    live_enabled = str(live_cfg.get("enabled", "true")).strip().lower() in (
-        "1", "true", "yes", "y", "on"
-    )
+    since_iso = dt.datetime.now().isoformat(timespec="seconds")
+
+    def _flag_on(section, default: str = "true") -> bool:
+        return str(section.get("enabled", default)).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+
+    live_enabled = _flag_on(live_cfg)
+    ir_enabled = _flag_on(ir_cfg)
+    want_temp = (not args.no_live_plot) and live_enabled
+    want_ir = (not args.no_live_plot) and (not args.no_ir_plot) and ir_enabled
+
     if args.no_live_plot:
-        logging.info("Live overlay plot disabled by --no-live-plot.")
-    elif not live_enabled:
-        logging.info("Live overlay plot disabled in config ([live_plot] enabled).")
+        logging.info("Live plot windows disabled by --no-live-plot.")
     else:
+        if not live_enabled:
+            logging.info("Temperature overlay plot disabled in config ([live_plot] enabled).")
+        if args.no_ir_plot:
+            logging.info("IR stack plot disabled by --no-ir-plot.")
+        elif not ir_enabled:
+            logging.info("IR stack plot disabled in config ([ir_plot] enabled).")
+
+    if want_temp or want_ir:
         done_file = session_dir / f"{run_stamp}.done"
         # Remove any stale sentinel (shouldn't exist for a fresh stamp, but be safe).
         try:
             done_file.unlink()
         except FileNotFoundError:
             pass
+    if want_temp:
         spawn_live_plot(
-            sample, Path(args.config), live_cfg, args.dry_run,
-            since_iso=dt.datetime.now().isoformat(timespec="seconds"),
+            sample, cfg_path, live_cfg, args.dry_run,
+            since_iso=since_iso,
             mode_label=mode_label,
             done_file=done_file,
             plot_dir=plot_dir,
             save_delay_s=live_cfg.get("save_delay_s", "600"),
+        )
+    if want_ir:
+        spawn_ir_plot(
+            sample, cfg_path, ir_cfg, args.dry_run,
+            since_iso=since_iso,
+            mode_label=mode_label,
+            done_file=done_file,
+            plot_dir=plot_dir,
         )
 
     # -- run --------------------------------------------------------------
@@ -1210,6 +1339,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             retry_delay_s=float(omnic_cfg.get("retry_delay_s", "5")),
         ) as omnic:
             omnic.load_parameters(exp_file, keep_bkg=True)
+            # Defeat OMNIC's "background is old -- collect a new one?" prompt by
+            # forcing the reuse-current-background mode with a very large max age.
+            # Done here (after load, before any collection) per the DDE manual.
+            omnic.set_background_aging(bg_max_age_min)
 
             # Per-step loop  -------------------------------------------
             # Filename index: a zero-based, zero-padded counter prepended to
@@ -1224,9 +1357,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 step_t0 = time.time()
 
                 logging.info("%s %d C ...", SCHEDULE_KINDS[direction]["arrow"], T)
-                specac.goto_and_wait(
-                    T, timeout=float(heater.get("ramp_timeout_s", "3600"))
-                )
+                ramp_timeout = float(heater.get("ramp_timeout_s", "3600"))
+                try:
+                    specac.goto_and_wait(T, timeout=ramp_timeout)
+                except subprocess.TimeoutExpired:
+                    # The cell never reached the setpoint within ramp_timeout_s.
+                    # On the cool-down tail this is expected: passive cooling is
+                    # slow near the (glovebox) ambient and may never reach a low
+                    # setpoint within tolerance.  Skip this step's collection
+                    # rather than crashing the whole run -- every spectrum already
+                    # collected is kept, and the heater is still switched off
+                    # cleanly in the finally block.
+                    logging.warning(
+                        "Setpoint wait for %d C (%s) timed out after %.0f s.  The "
+                        "cell could not reach %d C within +/-%s C in time -- on a "
+                        "cool-down this usually means the target is too close to "
+                        "the glovebox ambient for passive cooling.  Skipping this "
+                        "step and continuing.  To capture it: raise [heater] "
+                        "ramp_timeout_s, widen [heater] tolerance_c, or keep the "
+                        "cool-down's lowest temperature higher.",
+                        T, direction, ramp_timeout, T,
+                        heater.get("tolerance_c", "1"),
+                    )
+                    continue
 
                 # Sanity check: Specac.Cmd has been observed returning from
                 # "sp T w" while the cell was still far from T (stuck "Wait"

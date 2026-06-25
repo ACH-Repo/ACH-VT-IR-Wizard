@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vtir-wizard"
+dynamic = ["version"]
+description = "Variable-temperature IR orchestrator for a Thermo Nicolet iS5 + Specac heated Golden Gate ATR (drives the heater + OMNIC from one process)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Christian Nelle" }]
+keywords = [
+    "FTIR", "infrared", "spectroscopy", "OMNIC", "Specac",
+    "variable-temperature", "VT-IR", "DDE", "ATR",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "matplotlib>=3.5",
+    "numpy>=1.21",
+    "pywin32>=305; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/ACH-Repo/ACH-VT-IR-Wizard"
+Repository = "https://github.com/ACH-Repo/ACH-VT-IR-Wizard"
+Issues = "https://github.com/ACH-Repo/ACH-VT-IR-Wizard/issues"
+
+[project.scripts]
+# The single command the user asked for: `vtir-wizard` from anywhere.
+vtir-wizard = "vtir_wizard.orchestrator:_entry"
+
+[tool.hatch.version]
+path = "src/vtir_wizard/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vtir_wizard"]
+
+[tool.hatch.build.targets.sdist]
+# Ship the source plus the docs/launchers; the bundled config template under
+# src/vtir_wizard/data is included automatically as package data.
+include = [
+    "src/vtir_wizard",
+    "README.md",
+    "LICENSE",
+    "run_vt_ir.bat",
+]

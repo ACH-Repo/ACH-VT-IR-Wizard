@@ -1,22 +1,31 @@
 @echo off
 REM ============================================================
-REM   Double-click launcher for vt_ir.py
-REM   Runs the VT-IR orchestrator and pauses on exit so any
-REM   error message stays on screen.
+REM   Double-click launcher for the VT-IR wizard.
+REM   Requires the package to be installed once:
+REM       pip install vtir-wizard
+REM   (or, from a source checkout:  pip install .)
+REM   Pauses on exit so any error message stays on screen.
 REM ============================================================
 
 setlocal
 cd /d "%~dp0"
 
-REM Use the "py" launcher if available; fall back to plain "python".
-where py >nul 2>&1
+REM Prefer the installed console command; fall back to running the module
+REM directly from a source checkout (src/ layout) if it isn't on PATH yet.
+where vtir-wizard >nul 2>&1
 if %ERRORLEVEL%==0 (
-    py -3 vt_ir.py %*
+    vtir-wizard %*
 ) else (
-    python vt_ir.py %*
+    set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
+    where py >nul 2>&1
+    if %ERRORLEVEL%==0 (
+        py -3 -m vtir_wizard.orchestrator %*
+    ) else (
+        python -m vtir_wizard.orchestrator %*
+    )
 )
 
 echo.
-echo --- script exited with code %ERRORLEVEL% ---
+echo --- wizard exited with code %ERRORLEVEL% ---
 pause
 endlocal

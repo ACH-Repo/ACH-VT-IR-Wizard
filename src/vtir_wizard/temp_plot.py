@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
 """
-analyse_live.py  --  Live-updating overlay plot for a VT-IR session.
+vtir_wizard.temp_plot  --  Live temperature/setpoint overlay for a VT-IR session.
 
-While vt_ir.py is running, this opens a matplotlib window that re-reads the
+While the wizard is running, this opens a matplotlib window that re-reads the
 Specac controller's .log file and the .SPA files in the current session folder
 every few seconds and re-draws the temperature/setpoint trace with scan-event
 overlays.
 
-vt_ir.py launches this automatically (one window per run).  You can also run it
-standalone to re-examine a finished run.
+The orchestrator launches this automatically (one window per run).  You can also
+run it standalone to re-examine a finished run.
 
 Key behaviours:
 
-  * --since <ISO>   Clip the view to a single run's time window.  vt_ir.py
+  * --since <ISO>   Clip the view to a single run's time window.  The wizard
                     passes its run-start time here so the background pass and
                     the sample pass don't pile into one cramped plot.
   * Zoom is preserved across refreshes.  Once you zoom or pan, live updates
     stop rescaling the axes; press 'f' in the window to resume auto-follow.
-  * SVG auto-save.  When vt_ir.py signals the run is finished (via --done-file),
+  * SVG auto-save.  When the wizard signals the run is finished (via --done-file),
     the plot saves itself <save-delay> seconds later (capturing the cool-down
     tail).  It also saves on manual window close.  Files land in
     <plot-dir>/<sample>/<sample>_<LABEL>_<timestamp>.svg.
 
 Usage:
-    python analyse_live.py                       # auto-detect newest session + log
-    python analyse_live.py --sample MOF42_run3   # follow a specific session
-    python analyse_live.py --interval 10         # refresh every 10 s
-    python analyse_live.py --once                # render once and exit
+    python -m vtir_wizard.temp_plot                     # newest session + log
+    python -m vtir_wizard.temp_plot --sample MOF42_run3 # follow a specific session
+    python -m vtir_wizard.temp_plot --interval 10       # refresh every 10 s
+    python -m vtir_wizard.temp_plot --once              # render once and exit
 
 Close the matplotlib window to stop the loop.
 """
 from __future__ import annotations
 
 import argparse
-import configparser
 import os
 import re
 import sys
@@ -48,14 +47,11 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 
 # Single source of truth for per-direction shading colors + legend labels.
-# Lives in vt_ir.py because it's also used by the orchestrator's wizard
-# summary and per-step log line -- importing here keeps the producer and
-# consumer in sync, so renaming a suffix or adding a kind only requires
-# editing one table.
-from vt_ir import SCHEDULE_KINDS
+# Lives in vtir_wizard/__init__.py and is shared with the orchestrator and the
+# IR-stack plot, so renaming a suffix or adding a kind only touches one table.
+from vtir_wizard import SCHEDULE_KINDS
+from vtir_wizard import config as appconfig
 
-
-CONFIG_FILE = Path(__file__).with_name("vt_ir_config.ini")
 
 # Default Specac controller log folder; overridable via config + CLI.
 DEFAULT_SPECAC_LOGS = r"C:\Users\<you>\Documents\Specac Temperature Controller\Logs"
@@ -109,7 +105,7 @@ _BG_NAME_RE = re.compile(r"^(?:\d+_)?BG_", re.IGNORECASE)
 
 def classify_spa(name: str) -> str:
     """Map a .SPA filename to a key of SCHEDULE_KINDS based on naming
-    convention emitted by vt_ir.py: ``[NN_]BG_<sample>_<T>C.SPA`` for
+    convention emitted by the wizard: ``[NN_]BG_<sample>_<T>C.SPA`` for
     backgrounds, ``[NN_]<sample>_<T>C[_up|_down|_return].SPA`` for samples.
     The leading ``NN_`` chronological index is optional -- matches both
     indexed (current) and unindexed (pre-index-feature) files."""
@@ -143,13 +139,6 @@ def find_session_dir(output_root: Path, sample: Optional[str]) -> Optional[Path]
         return d if d.exists() else None
     subdirs = [p for p in output_root.iterdir() if p.is_dir()] if output_root.exists() else []
     return newest(subdirs)
-
-
-def load_config(path: Path) -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
-    if path.exists():
-        cfg.read(path, encoding="utf-8")
-    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +282,9 @@ def _read_finish_time(done_file: Path) -> float:
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    p.add_argument("--config", default=str(CONFIG_FILE),
-                   help="Path to vt_ir_config.ini (default: next to this script).")
+    p.add_argument("--config", default=None,
+                   help="Path to vt_ir_config.ini (default: search order -- "
+                        "current folder then %%APPDATA%%/vtir-wizard).")
     p.add_argument("--sample", default=None,
                    help="Sample name to follow (default: newest folder under output_root).")
     p.add_argument("--specac-logs", default=None,
@@ -305,14 +295,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Refresh interval in seconds (default 5).")
     p.add_argument("--once", action="store_true",
                    help="Render the plot once and exit (no auto-save).")
-    # Args below are normally supplied by vt_ir.py when it spawns the plotter.
+    # Args below are normally supplied by the wizard when it spawns the plotter.
     p.add_argument("--since", default=None,
                    help="ISO timestamp; clip the view to data at/after this time "
                         "(scopes the plot to one run).")
     p.add_argument("--label", default="SNAPSHOT",
                    help="BG or SAMPLE -- used in the saved SVG filename.")
     p.add_argument("--done-file", default=None,
-                   help="Sentinel file vt_ir.py writes when the run finishes; "
+                   help="Sentinel file the wizard writes when the run finishes; "
                         "triggers the delayed auto-save.")
     p.add_argument("--plot-dir", default=None,
                    help="Where to save SVG snapshots (default: [paths] plot_dir, "
@@ -322,7 +312,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "(default: [live_plot] save_delay_s, else 600).")
     args = p.parse_args(argv)
 
-    cfg = load_config(Path(args.config))
+    cfg_path = appconfig.resolve_config_path(args.config)
+    cfg = appconfig.load_config_optional(cfg_path)
     paths = cfg["paths"] if cfg.has_section("paths") else {}
     live = cfg["live_plot"] if cfg.has_section("live_plot") else {}
 
