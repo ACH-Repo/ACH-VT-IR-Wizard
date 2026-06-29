@@ -13,7 +13,7 @@ the orchestrator's pywin32 dependency.
 """
 from __future__ import annotations
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 # Single source of truth for per-direction metadata used across the wizard
 # summary (glyph), the per-step log line (arrow), and the live plots' overlay

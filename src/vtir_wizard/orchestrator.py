@@ -435,7 +435,13 @@ class OmnicDDE:
         self.exec("SetAsBackground")
 
     def export(self, path: str) -> None:
-        self.exec(f'Export "{path}"')
+        # Export is a plain Exec, but OMNIC can momentarily wedge right after a
+        # collection (a dialog pops, or the bench/DDE channel hiccups), making
+        # this Exec block ~60 s and raise dde.error -- which would otherwise lose
+        # the spectrum that was just collected.  Losing real data to a transient
+        # export failure is worse than for a collection, so reconnect-and-retry
+        # here too (same collect_retries / retry_delay_s knobs as the collects).
+        self.exec_resilient(f'Export "{path}"', "Export")
 
     def clear(self) -> None:
         self.exec("DeleteSelectedSpectra")

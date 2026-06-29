@@ -397,10 +397,13 @@ long passive cool-down, the lengthening gap between scans may be letting the
 bench idle out; restarting OMNIC before the sample pass and keeping an eye on
 the first down-scan collection is the practical workaround.
 
-**`dde.error: Exec failed` mid-collection** — the underlying pywin32 error
-behind the message above (pywin32's DDE Exec has a hard 60 s transaction
-timeout, which trips when OMNIC can't start the command). Handled by the
-retry/reconnect logic; see the entry above.
+**`dde.error: Exec failed` mid-collection or on `Export`** — the underlying
+pywin32 error (its DDE Exec has a hard 60 s transaction timeout, which trips when
+OMNIC momentarily can't process a command — a dialog popped, or the bench/channel
+hiccuped). The collection *and* (as of v1.4.4) the `Export` steps reconnect and
+retry on this; if it still fails after the retries, bring the OMNIC window to the
+front, dismiss any open dialog, and if it persists **restart OMNIC** (the bench
+can stay wedged across runs until you do).
 
 **Heater not switching off after a crash** — the `finally` block calls
 `specac.cmd off` on every exit path, including Ctrl-C. If you killed the
