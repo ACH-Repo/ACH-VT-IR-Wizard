@@ -210,7 +210,7 @@ ACH-VT-IR-Wizard/
 │   ├── orchestrator.py         the run wizard (the `vtir-wizard` command)
 │   ├── temp_plot.py            live temperature/setpoint overlay window
 │   ├── ir_plot.py              live stacked-IR-spectrum window
-│   ├── spectra_io.py           native .SPA/.csv/.jdx readers + styling
+│   ├── spectra_io.py           native .SPA/.sp/.csv/.jdx readers + styling
 │   ├── config.py               config discovery + --init-config
 │   └── data/vt_ir_config.ini   bundled config template
 ├── run_vt_ir.bat               double-click launcher for the wizard

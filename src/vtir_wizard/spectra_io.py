@@ -8,7 +8,7 @@ ported back and forth.
 Covers exactly what `ir_plot.py` needs:
 
     * the wizard file-naming convention (`classify`, `NAME_RE`)
-    * native readers for `.SPA` / `.csv` / `.jdx` (`read_xy` and friends)
+    * native readers for `.SPA` / `.sp` / `.csv` / `.jdx` (`read_xy` and friends)
     * Absorbance/Transmittance resolution + conversion
     * a temperature colormap, an auto offset, and IR-convention axis styling
 """
@@ -43,7 +43,18 @@ NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-SUPPORTED_EXTS = (".csv", ".spa", ".jdx", ".dx", ".jcm", ".txt")
+SUPPORTED_EXTS = (".csv", ".spa", ".sp", ".jdx", ".dx", ".jcm", ".txt")
+
+# PerkinElmer .sp y-axis label -> internal unit token.
+PE_YUNIT: Dict[str, str] = {
+    "%T": "T", "T": "T", "TRANSMITTANCE": "T", "%TRANSMITTANCE": "T",
+    "A": "A", "ABS": "A", "ABSORBANCE": "A",
+    "%R": "R%", "R": "R%", "REFLECTANCE": "R%",
+    "LOG(1/R)": "logR", "KM": "KM", "K-M": "KM", "KUBELKA-MUNK": "KM",
+}
+
+# PerkinElmer .sp block ids (uint16) inside the DataSet container.
+_PE_XRANGE, _PE_YLABEL, _PE_DATA = 0x8B72, 0x8B78, 0x8B7C
 
 # OMNIC SPA y data-type code -> internal unit token (per spectrochempy).
 OMNIC_YCODE: Dict[int, str] = {
@@ -217,10 +228,68 @@ def read_jcampdx(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[str]]:
     return x, y, unit
 
 
+def read_sp(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[str]]:
+    """PerkinElmer ``.sp`` binary ('PEPE2D constant interval DataSet file').
+
+    Block-structured, unrelated to Thermo's ``.spa``. Walks the block tree for
+    the x-range (block 0x8b72: first/last wavenumber as two float64), the
+    float64 intensity array (block 0x8b7c: a 2-byte tag + uint32 byte length +
+    that many doubles), and the y-axis label (block 0x8b78) recording whether
+    the data is %transmittance or absorbance."""
+    raw = Path(path).read_bytes()
+    if not raw.startswith(b"PEPE"):
+        raise ValueError("not a PerkinElmer .sp file (bad signature)")
+    n = len(raw)
+
+    blocks: Dict[int, bytes] = {}
+
+    def walk(start: int, end: int) -> None:
+        pos = start
+        while pos + 6 <= end:
+            bid = struct.unpack_from("<H", raw, pos)[0]
+            size = struct.unpack_from("<I", raw, pos + 2)[0]
+            content = pos + 6
+            if bid == 0 and size == 0:
+                break
+            if content + size > end:
+                break
+            if bid < 0x8000:          # container block -> descend
+                walk(content, content + size)
+            else:
+                blocks[bid] = raw[content:content + size]
+            pos = content + size
+
+    i = raw.index(b"\x00", 4)         # end of the description string
+    while i < n and raw[i] == 0:      # skip zero padding
+        i += 1
+    if i + 6 > n:
+        raise ValueError("not a recognizable PerkinElmer .sp file (no blocks)")
+    ds_size = struct.unpack_from("<I", raw, i + 2)[0]
+    walk(i + 6, min(i + 6 + ds_size, n))
+
+    if _PE_DATA not in blocks or _PE_XRANGE not in blocks:
+        raise ValueError("not a recognizable PerkinElmer .sp file (missing data)")
+
+    data = blocks[_PE_DATA]
+    dlen = struct.unpack_from("<I", data, 2)[0]
+    y = np.frombuffer(data[6:6 + dlen], dtype="<f8").astype(float)
+    first_x, last_x = struct.unpack_from("<dd", blocks[_PE_XRANGE], 2)
+    x = np.linspace(first_x, last_x, len(y))
+
+    unit = None
+    if _PE_YLABEL in blocks:
+        body = blocks[_PE_YLABEL]
+        ln = struct.unpack_from("<H", body, 2)[0]
+        unit = PE_YUNIT.get(body[4:4 + ln].decode("latin-1", "replace").strip().upper())
+    return x, y, unit
+
+
 def read_xy(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[str]]:
     ext = path.suffix.lower()
     if ext == ".spa":
         return read_spa(path)
+    if ext == ".sp":
+        return read_sp(path)
     if ext in (".jdx", ".dx", ".jcm"):
         return read_jcampdx(path)
     return read_csv(path)
