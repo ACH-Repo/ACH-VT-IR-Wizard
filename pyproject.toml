@@ -60,4 +60,5 @@ include = [
     "README.md",
     "LICENSE",
     "run_vt_ir.bat",
+    "run_analyse_live.bat",
 ]
