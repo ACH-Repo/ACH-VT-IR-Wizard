@@ -46,9 +46,13 @@ vtir-wizard = "vtir_wizard.orchestrator:_entry"
 path = "src/vtir_wizard/__init__.py"
 
 [tool.hatch.build.targets.wheel]
+# Pin the core-metadata version: newer hatchling defaults to 2.5, which
+# twine (<=6.2) refuses to parse, so the upload fails before it reaches PyPI.
+core-metadata-version = "2.4"
 packages = ["src/vtir_wizard"]
 
 [tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"
 # Ship the source plus the docs/launchers; the bundled config template under
 # src/vtir_wizard/data is included automatically as package data.
 include = [
